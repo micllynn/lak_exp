@@ -902,7 +902,6 @@ class TwoPRec(object):
                 self.sector.tr_counts = {k: 0 for k in _tr_conds}
                 for trial in range(self.beh._stimrange.first,
                                    self.beh._stimrange.last):
-                    print(f'\t\t\t{int(trial)}', end='\r')
                     _t_stim = self.beh.stim.t_start[trial]
                     _t_start = _t_stim - t_pre
                     _t_end = _all_rew_t[trial] + t_post
@@ -1241,12 +1240,6 @@ class TwoPRec(object):
             _probe = np.mean(rec[_ind0:_ind0 + n_frames_pre], axis=(1, 2))
             _f0_probe = float(np.mean(_probe)) if _probe.size > 0 else 1.0
             if np.abs(_f0_probe) < 1.0:
-                print(f'\tWarning: baseline fluorescence mean '
-                      f'({_f0_probe:.4f}) is near zero. '
-                      'Signal appears to be a corrected residual. '
-                      'Falling back to z-score. '
-                      'Pass use_zscore=True explicitly '
-                      'to suppress this check.')
                 _use_zscore = True
 
         if _use_zscore and not auto_gain_dff:
@@ -1278,7 +1271,6 @@ class TwoPRec(object):
         )
 
         if not _sector_cache_valid:
-            print('creating trial-averaged signal (sectors)...')
             self.add_sectors(
                 n_sectors=n_sectors, t_pre=t_pre, t_post=t_post,
                 resid_type=resid_type,

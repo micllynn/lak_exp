@@ -2,20 +2,22 @@
 
 ## Project overview
 
-**lak_exp** — Python package for loading and analyzing rodent Pavlovian behavior
-experiments with Neuropixels electrophysiology or two-photon calcium imaging.
-Data is acquired with RigBox (Block.mat / Timeline.mat files).
+This is a Python package for loading and analyzing complex rodent behaviour experiments
+with simultaneous neural recordings (two-photon imaging or high-density neurophysiology).
+It focuses on parsing complex behavioural readouts and aligning with neural recordings
+for complex plotting and analysis.
 
-```bash
-pip install -e .
-```
+## Data types
+- Behaviour: standardized Rigbox behavioural outputs (.Block and .Timeline files)
+- Imaging (Bruker/Suite2P pipeline): .tif stacks up to 20GB (memmap required) and Suite2P
+.npy outputs.
+- Neurophysiology (Neuropixels/Kilosort pipeline): Standard Kilosort .npy objects.
 
 ## Key modules
-
 | Module | Purpose |
 |---|---|
-| `load_exp_twop.py` | `TwoPRec`, `TwoPRec_DualColour` — main 2p loaders |
-| `load_exp.py` | `ExpObj_ReportOpto`, `ExpObj_ValuePFC` — Neuropixels loaders |
+| `load_exp_twop.py` | `TwoPRec`, `TwoPRec_DualColour` — main two-photon loaders |
+| `load_exp.py` | `ExpObj_ReportOpto`, `ExpObj_ValuePFC` — neurophysiology loaders |
 | `beh.py` | `BlockParser`, `TimelineParser`, `StimParserNew` — behavior parsing |
 | `exp_defs.py` | `ExpSubtypes` — `beh_type` → subtypes dict factory |
 | `dset_twop.py` / `dset.py` | Dataset metadata (CSV-backed) |
