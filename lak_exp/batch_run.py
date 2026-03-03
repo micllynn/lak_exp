@@ -4,7 +4,7 @@ batch_run.py  –  Utilities for batch-loading and processing Marko-style
 
 Usage example
 -------------
-from lak_exp.batch_run import batch_run_marko
+from lak_exp.batch_run import batch_run
 from lak_exp.load_exp_twop import TwoPRec
 
 EXP_DICTS = {
@@ -30,7 +30,7 @@ EXP_DICTS = {
 #   - a (name, args, kwargs) tuple      -> exp.method(*args, **kwargs)
 #   - a callable                        -> fn(exp)
 
-results = batch_run_marko(
+results = batch_run(
     EXP_DICTS,
     steps=['add_neurs', ('add_sectors', {'use_zscore': True})],
     rec_class=TwoPRec,

@@ -418,8 +418,8 @@ class StimParser(object):
             self.prob = np.array([np.mean(self._all_stimprobs)])
             self.size = np.array([np.mean(self._all_stimsizes)])
 
-            # Set ori to average for compatibility
-            self.ori = np.array([np.mean(self._all_stimoris)])
+            # Set ori to 0 for compatibility (no orientation when parse_by=None)
+            self.ori = np.array([0])
             self.stimtype = np.array([0])
 
         return
