@@ -290,6 +290,57 @@ class TimelineParser(object):
         return data
 
 
+class _StimParser_Old(object):
+    def __init__(self, beh):
+        """
+        Takes a BehData object as input and compiles a list
+        of all delivered stimuli, stored as .id (identifier in
+        the original ExpDef and Block file), .size (in uL)
+        and .prob (delivery probability).
+        """
+
+        self._all_stimtypes = beh._data.get_event_var(
+            'stimulusTypeValues')
+
+        self._all_stimprobs = beh._data.get_event_var(
+            'rewardProbabilityValues')
+
+        self._all_stimsizes = beh._data.get_event_var(
+            'rewardMagnitudeValues')
+
+        self.id, self._st_inds = np.unique(self._all_stimtypes, return_index=True)
+        self.prob = np.zeros_like(self.id, dtype=float)
+        self.size = np.zeros_like(self.id, dtype=float)
+
+        for ind, stimtype in enumerate(self.id):
+            # find the first instance of this stimtype
+            _first_ind = self._st_inds[ind]
+            _stimprob = self._all_stimprobs[_first_ind]
+            _stimsize = self._all_stimsizes[_first_ind]
+
+            # save the probability and reward size for this
+            self.prob[ind] = _stimprob
+            self.size[ind] = _stimsize
+
+        return
+
+    def print_summary(self):
+        """
+        Print a summary of all stimulus presentations.
+
+        Returns
+        -------
+        None
+            Prints stimulus information to console.
+        """
+        print('printing a list of stims...')
+        for ind, stimtype in enumerate(self.id):
+            print(f'id:{stimtype} | size:{self.size[ind]} ',
+                  f'| prob:{self.prob[ind]}')
+
+        return
+
+
 class StimParser(object):
     def __init__(self, beh, parse_by='stimulusOrientation',
                  load_rew_mag_prob=True):
@@ -418,8 +469,8 @@ class StimParser(object):
             self.prob = np.array([np.mean(self._all_stimprobs)])
             self.size = np.array([np.mean(self._all_stimsizes)])
 
-            # Set ori to 0 for compatibility (no orientation when parse_by=None)
-            self.ori = np.array([0])
+            # Set ori to average for compatibility
+            self.ori = np.array([np.mean(self._all_stimoris)])
             self.stimtype = np.array([0])
 
         return
@@ -441,164 +492,6 @@ class StimParser(object):
         return
 
 
-class StimParserNew(object):
-    def __init__(self, beh, parse_by='stimulusOrientation',
-                 load_rew_mag_prob=True, subtypes=None):
-        """
-        Parses trial-types from a Block file, with optional combinatorial
-        sub-trial-type definitions.
-
-        Identical to StimParser for base condition parsing. The additional
-        ``subtypes`` argument declaratively defines extra sub-conditions from
-        any combination of event variables, without hardcoding.
-
-        Parameters
-        ----------
-        beh : Behavior class instance
-        parse_by : str or None
-            Same as StimParser.  Passed to get_param_var() and parsed as usual.
-        load_rew_mag_prob : bool
-            Load reward probability and magnitude arrays.
-        subtypes : dict or None
-            Optional dict defining sub-trial-types combinatorially.
-
-            Format::
-
-                subtypes = {
-                    'label': {
-                        'parent': '0.5',    # base-condition str, or None
-                        'filters': {        # event_var_name -> value or callable
-                            'isRewardGivenValues': 1,
-                            'anticipatoryLickValues': lambda x: x > 0,
-                        }
-                    },
-                    ...
-                }
-
-            Each filter value can be:
-              - A scalar  →  trial included if  event_var_array == scalar
-              - A callable →  trial included if  callable(event_var_array) is True
-                              (operates element-wise on the full array)
-            Multiple filters are AND-ed together.
-            ``parent`` restricts to trials whose base-condition string matches;
-            use ``None`` to consider all trials regardless of base condition.
-
-        Attributes
-        ----------
-        subtype_tr_inds : dict
-            ``{label: np.ndarray}`` of zero-based trial indices for every
-            defined subtype (populated even when ``subtypes`` is empty).
-        """
-        self.parse_by = parse_by
-        self.subtypes = subtypes if subtypes is not None else {}
-
-        # ------------------------------------------------------------------
-        # Phase 1 — base parsing (identical to StimParser)
-        # ------------------------------------------------------------------
-        if load_rew_mag_prob:
-            self._all_stimprobs = beh._data.get_event_var(
-                'rewardProbabilityValues')
-            self._all_stimsizes = beh._data.get_event_var(
-                'rewardMagnitudeValues')
-
-        if type(parse_by) == str:
-            # --- determine _all_parsed_param (source varies by variable) ---
-            if parse_by == 'stimulusTypeValues':
-                # event var, single-value format
-                _param_raw = beh._data.get_event_var(parse_by)
-                self._all_parsed_param = np.asarray(_param_raw)
-            else:
-                # param var ('stimulusOrientation' or any generic string)
-                _param_raw = beh._data.get_param_var(parse_by)
-                if len(_param_raw) > 0 and hasattr(_param_raw[0], '__len__'):
-                    # array-of-arrays format (e.g. stimulusOrientation)
-                    self._all_parsed_param = np.array(
-                        [_param_raw[i][0] for i in range(len(_param_raw))])
-                else:
-                    # scalar-per-trial format
-                    self._all_parsed_param = np.array(_param_raw)
-
-            # --- common: unique values and per-condition stats ---
-            self.parsed_param, _st_inds = np.unique(
-                self._all_parsed_param, return_index=True)
-            self.prob = np.zeros_like(self.parsed_param, dtype=float)
-            self.size = np.zeros_like(self.parsed_param, dtype=float)
-            for ind in range(len(self.parsed_param)):
-                _fi = _st_inds[ind]
-                self.prob[ind] = self._all_stimprobs[_fi]
-                self.size[ind] = self._all_stimsizes[_fi]
-
-            # --- backward-compat aliases ---
-            if parse_by == 'stimulusOrientation':
-                self._all_stimoris = self._all_parsed_param
-            self.ori = self.parsed_param
-            self.stimtype = self.parsed_param
-
-        elif parse_by is None:
-            self.parsed_param = np.array([0])
-            n_trials = len(self._all_stimprobs)
-            self._all_parsed_param = np.zeros(n_trials)
-            self.prob = np.array([np.mean(self._all_stimprobs)])
-            self.size = np.array([np.mean(self._all_stimsizes)])
-            self.ori = np.array([np.mean(
-                beh._data.get_param_var('stimulusOrientation'))])
-            self.stimtype = np.array([0])
-
-        # ------------------------------------------------------------------
-        # Phase 2 — subtype resolution
-        # ------------------------------------------------------------------
-        self.subtype_tr_inds = {}
-        if self.subtypes:
-            # pre-fetch every event_var referenced by any filter
-            _event_cache = {}
-            _missing_vars = set()
-            for _spec in self.subtypes.values():
-                for _var in _spec.get('filters', {}).keys():
-                    if _var not in _event_cache and _var not in _missing_vars:
-                        try:
-                            _event_cache[_var] = np.asarray(
-                                beh._data.get_event_var(_var))
-                        except (ValueError, KeyError):
-                            _missing_vars.add(_var)
-
-            n_trials = len(self._all_parsed_param)
-            _all_parsed_str = np.array(
-                [str(v) for v in self._all_parsed_param])
-
-            for label, spec in self.subtypes.items():
-                _filters = spec.get('filters', {})
-                if _missing_vars & _filters.keys():
-                    self.subtype_tr_inds[label] = np.array([], dtype=int)
-                    continue
-
-                mask = np.ones(n_trials, dtype=bool)
-
-                parent = spec.get('parent', None)
-                if parent is not None:
-                    mask &= (_all_parsed_str == str(parent))
-
-                for var_name, criterion in _filters.items():
-                    arr = _event_cache[var_name]
-                    if callable(criterion):
-                        mask &= criterion(arr)
-                    else:
-                        mask &= (arr == criterion)
-
-                self.subtype_tr_inds[label] = np.where(mask)[0]
-
-        return
-
-    def print_summary(self):
-        _params = getattr(self, 'ori', self.parsed_param)
-        print('printing a list of stims...')
-        for ind, p in enumerate(_params):
-            print(f'param:{p} | size:{self.size[ind]} | prob:{self.prob[ind]}')
-        if self.subtype_tr_inds:
-            print('subtypes:')
-            for label, inds in self.subtype_tr_inds.items():
-                print(f'  {label}: {len(inds)} trials')
-
-
 class BehDataSimpleLoad(object):
     def __init__(self, folder, parse_stims=True,
                  parse_by='stimulusOrientation'):
@@ -606,21 +499,12 @@ class BehDataSimpleLoad(object):
         print('loading behavior...')
 
         # search for appropriate block.mat file
-        self.fname_blk = None
-        self.fname_tl = None
         files = os.listdir(folder)
         for f in files:
             if f.startswith('20') and f.endswith('Block.mat'):
                 self.fname_blk = f
             elif f.startswith('20') and f.endswith('Timeline.mat'):
                 self.fname_tl = f
-
-        if self.fname_blk is None:
-            raise FileNotFoundError(
-                f'No Block.mat file found in {folder}')
-        if self.fname_tl is None:
-            raise FileNotFoundError(
-                f'No Timeline.mat file found in {folder}')
 
         print('\tloading Block and Timeline files')
         # load block data with BlockParser
@@ -961,21 +845,12 @@ class BehData_ReportOpto(object):
         print('loading behavior...')
 
         # search for appropriate block.mat file
-        self.fname_blk = None
-        self.fname_tl = None
         files = os.listdir(folder)
         for f in files:
             if f.startswith('20') and f.endswith('Block.mat'):
                 self.fname_blk = f
             elif f.startswith('20') and f.endswith('Timeline.mat'):
                 self.fname_tl = f
-
-        if self.fname_blk is None:
-            raise FileNotFoundError(
-                f'No Block.mat file found in {folder}')
-        if self.fname_tl is None:
-            raise FileNotFoundError(
-                f'No Timeline.mat file found in {folder}')
 
         print('\tloading Block and Timeline files')
         # load block data with BlockParser
@@ -1356,21 +1231,12 @@ class BehData_ValuePFC(object):
         print('loading behavior...')
 
         # search for appropriate block.mat file
-        self.fname_blk = None
-        self.fname_tl = None
         files = os.listdir(folder)
         for f in files:
             if f.startswith('20') and f.endswith('Block.mat'):
                 self.fname_blk = f
             elif f.startswith('20') and f.endswith('Timeline.mat'):
                 self.fname_tl = f
-
-        if self.fname_blk is None:
-            raise FileNotFoundError(
-                f'No Block.mat file found in {folder}')
-        if self.fname_tl is None:
-            raise FileNotFoundError(
-                f'No Timeline.mat file found in {folder}')
 
         print('\tloading Block and Timeline files')
         # load block data with BlockParser

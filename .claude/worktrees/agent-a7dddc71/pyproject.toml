@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lak-exp"
+version = "0.1"
+description = "LakLab MouseLoader: Package for loading and analyzing rodent visual behavior experiments with Neuropixels data, including histology registration, alignment tools, and RigBox Timeline/Block file parsers"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "mbfl", email = "micllynn@gmail.com"}
+]
+keywords = [
+    "neuropixels",
+    "electrophysiology",
+    "behavior",
+    "neuroscience",
+    "two-photon",
+    "imaging",
+    "histology",
+    "rigbox",
+    "mouse",
+    "laklab"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "matplotlib>=3.4.0",
+    "seaborn>=0.11.0",
+    "pandas>=1.3.0",
+    "scikit-learn>=1.0.0",
+    "statsmodels>=0.13.0",
+    "tifffile>=2021.0.0",
+    "zetapy>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "flake8>=4.0.0",
+    "mypy>=0.950",
+]
+
+[project.urls]
+Homepage = "https://github.com/mbfl/lak_exp"
+Repository = "https://github.com/mbfl/lak_exp"
+
+[project.scripts]
+beh-check = "lak_exp.cmd_line_tools.beh_check:main"
+
+[tool.setuptools]
+packages = ["lak_exp", "lak_exp.cmd_line_tools"]
+
+[tool.setuptools.package-data]
+lak_exp = ["*.py"]

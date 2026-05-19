@@ -1,0 +1,27 @@
+.DS_Store
+**/.DS_Store
+
+# Python cache
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Emacs/editor temp files
+\#*
+*\#
+*.orig
+*.bak
+*.swp
+*~
+
+# Python packaging
+*.egg-info/
+**/*.egg-info/
+dist/
+build/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/

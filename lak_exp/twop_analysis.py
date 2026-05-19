@@ -197,10 +197,9 @@ class AnalysisMixin:
             Trial conditions to use for residual computation when
             beh_type='visual_pavlov'.
         """
-        import seaborn as sns
+        from .twop_plots import PlotsMixin
         if colors is None:
-            colors = sns.cubehelix_palette(
-                n_colors=3, start=2, rot=0, dark=0.2, light=0.8)
+            colors = PlotsMixin._channel_palette(channel, n_colors=3)
 
         self.add_lickrates(t_prestim=t_pre, t_poststim=t_post)
 
@@ -321,7 +320,6 @@ class AnalysisMixin:
         # ---------------------
         print('\textracting aligned fluorescence traces...')
         _n_trace = 1
-        _all_rew_t = self.beh._data.get_event_var('totalRewardTimes')
         for n_x in range(n_sectors):
             for n_y in range(n_sectors):
                 print(f'\t\tsector {_n_trace}/{n_sectors**2}...      ',
@@ -352,17 +350,12 @@ class AnalysisMixin:
                 for trial in range(self.beh._stimrange.first,
                                    self.beh._stimrange.last):
                     _t_stim = self.beh.stim.t_start[trial]
-                    _t_start = _t_stim - t_pre
-                    _t_end = _all_rew_t[trial] + t_post
+                    _ind_t_start = np.searchsorted(
+                        rec_t, _t_stim - t_pre)
 
-                    _ind_t_start = np.argmin(np.abs(
-                        rec_t - _t_start))
-                    _ind_t_end = np.argmin(np.abs(
-                        rec_t - _t_end)) + 2   # add frames to end
-
-                    # extract fluorescence
+                    # extract fluorescence using fixed stim-aligned window
                     _f = np.mean(np.mean(
-                        rec[_ind_t_start:_ind_t_end,
+                        rec[_ind_t_start:_ind_t_start + n_frames_tot,
                                  _ind_x_lower:_ind_x_upper,
                                  _ind_y_lower:_ind_y_upper], axis=1),
                                  axis=1)
@@ -438,6 +431,89 @@ class AnalysisMixin:
         if compute_null:
             self.add_null_dists(n_null=n_null, t_pre=t_pre, t_post=t_post)
 
+        return
+
+    def add_lr_sides(self, t_pre=2, t_post=5,
+                     channel=None, use_zscore=False):
+        """Trial-aligned mean fluorescence for the top and bottom halves
+        of the field of view.
+
+        The image is split along axis 1 (image rows) at the midpoint. By the
+        recording geometry, the bottom half of the image corresponds to the
+        left side of the tissue, and the top half to the right side.
+
+        Parameters
+        ----------
+        t_pre : float
+            Seconds before stim onset to include.
+        t_post : float
+            Seconds after stim onset to include.
+        channel : str or None
+            Passed to _get_rec() / _get_rec_t().
+        use_zscore : bool
+            If True, use z-score instead of df/f.
+        """
+        _ch_str = f', ch={channel}' if channel is not None else ''
+        print(f'creating trial-averaged signal (lr sides{_ch_str})...')
+
+        self.add_lickrates()
+
+        rec = self._get_rec(channel)
+        rec_t = self._get_rec_t(channel)
+
+        self.sides = SimpleNamespace()
+        self.sides.params = SimpleNamespace()
+        self.sides.params.t_rew_pre = t_pre
+        self.sides.params.t_rew_post = t_post
+        self.sides.params.channel = channel
+        self.sides.params.use_zscore = use_zscore
+
+        n_frames_pre, n_frames_post, n_frames_tot, t_vec = \
+            self._aligned_frame_params(t_pre, t_post, t_event=2)
+        self.sides.t = t_vec
+
+        h_mid = rec.shape[1] // 2
+        self.sides.h_mid = h_mid
+
+        _halves = ('top', 'bottom')
+        self.sides.dff = {
+            half: self._init_dff_by_cond(self.beh.tr_conds, n_frames_tot)
+            for half in _halves}
+        self.sides.tr_counts = {
+            half: {k: 0 for k in self.beh.tr_conds}
+            for half in _halves}
+
+        _trials = np.arange(self.beh._stimrange.first,
+                            self.beh._stimrange.last)
+        _all_ind_t_start = np.searchsorted(
+            rec_t, self.beh.stim.t_start[_trials] - t_pre)
+
+        for tr_ind, trial in enumerate(_trials):
+            print(f'\ttrial={int(trial)}', end='\r')
+            _ind_t_start = _all_ind_t_start[tr_ind]
+            _chunk = rec[_ind_t_start:_ind_t_start + n_frames_tot, :, :]
+
+            _f_per_half = {
+                'top': np.mean(np.mean(_chunk[:, :h_mid, :], axis=1), axis=1),
+                'bottom': np.mean(np.mean(_chunk[:, h_mid:, :], axis=1),
+                                  axis=1)}
+
+            for half, _f in _f_per_half.items():
+                if use_zscore:
+                    _baseline = _f[:n_frames_pre]
+                    _sigma = np.std(_baseline)
+                    _dff = (_f - np.mean(_baseline)) / _sigma \
+                        if _sigma > 0 else np.zeros_like(_f)
+                else:
+                    _dff = calc_dff(_f, baseline_frames=n_frames_pre)
+
+                for _tr_cond in self._trial_cond_map.get(int(trial), []):
+                    if _tr_cond in self.sides.dff[half]:
+                        self.sides.dff[half][_tr_cond][
+                            self.sides.tr_counts[half][_tr_cond], :] = \
+                            _dff[0:n_frames_tot]
+                        self.sides.tr_counts[half][_tr_cond] += 1
+        print('')
         return
 
     def add_neurs(self, t_pre=1, t_post=2, zscore=True):

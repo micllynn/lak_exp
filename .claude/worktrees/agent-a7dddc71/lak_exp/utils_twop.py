@@ -97,96 +97,34 @@ def stitch_tiffs(directory, chan=0,
     return
 
 
-def _read_functional_chan(plane_dir):
-    """Return (functional_chan, nchannels) read from suite2p ops.npy.
-
-    suite2p writes 'reg_tif/' for the *functional* channel and
-    'reg_tif_chan2/' for the non-functional channel. Which raw channel
-    (Ch1 vs Ch2) ends up where therefore depends on `functional_chan` in
-    the ops file. We read it directly so the stitch step routes outputs
-    to the correct compiled_ChX.tif filename.
-
-    Parameters
-    ----------
-    plane_dir : str
-        Path to the suite2p/plane0 directory containing ops.npy.
-
-    Returns
-    -------
-    functional_chan : int
-        1 or 2. Defaults to 1 if ops.npy cannot be read.
-    nchannels : int
-        1 or 2. Defaults to 2 if ops.npy cannot be read.
-    """
-    ops_path = os.path.join(plane_dir, 'ops.npy')
-    try:
-        ops = np.load(ops_path, allow_pickle=True).item()
-        functional_chan = int(ops.get('functional_chan', 1))
-        nchannels = int(ops.get('nchannels', 2))
-    except (FileNotFoundError, OSError, ValueError) as e:
-        print(f'  warning: could not read {ops_path}: {e}')
-        print(f'  assuming functional_chan=1, nchannels=2')
-        functional_chan = 1
-        nchannels = 2
-    return functional_chan, nchannels
-
-
 def stitch_and_move_all_tiffs(directory):
     """
-    Takes an imaging folder that has been registered using suite2p,
-    stitches all tiffs from each registered channel, and moves the
-    compiled files back to the main imaging directory.
+    Takes an imaging folder with two channels that has been
+    registered using suite2p.
 
-    The suite2p convention is:
-        suite2p/plane0/reg_tif/        -> functional channel frames
-        suite2p/plane0/reg_tif_chan2/  -> non-functional channel frames
-
-    Output filenames (compiled_Ch1.tif / compiled_Ch2.tif) are assigned
-    based on `functional_chan` in suite2p's ops.npy, so that Ch1/Ch2
-    labels reflect the original raw-channel identity rather than
-    suite2p's internal functional/non-functional split.
+    Stitches all tiffs from both channels in the suite2p folder,
+    and moves them back to the main imaging directory.
 
     Parameters
     ---------
     directory: string
-        Path to the main imaging folder (t-00x). Must have a suite2p
-        folder inside.
+        Path to the main imaging folder (t-00x). Must
+        have a suite2p folder inside
     """
 
     os.chdir(directory)
 
-    plane_dir = os.path.join('suite2p', 'plane0')
-    functional_chan, nchannels = _read_functional_chan(plane_dir)
-    other_chan = 2 if functional_chan == 1 else 1
+    print('Ch2....\n------------')
+    stitch_tiffs_memmap('suite2p/plane0/reg_tif', chan=2)
+    print('moving compiled_Ch2.tif....')
+    os.rename('suite2p/plane0/reg_tif/compiled_Ch2.tif',
+              'compiled_Ch2.tif')
 
-    # reg_tif/ holds the functional channel
-    # -------------------------------------------------------
-    func_dir = os.path.join(plane_dir, 'reg_tif')
-    func_out = f'compiled_Ch{functional_chan}.tif'
-    try:
-        print(f'Ch{functional_chan} (functional, from reg_tif/)....\n'
-              f'------------')
-        stitch_tiffs_memmap(func_dir, chan=functional_chan)
-        print(f'moving {func_out}....')
-        os.rename(os.path.join(func_dir, func_out), func_out)
-    except Exception as e:
-        print(f'Ch{functional_chan} skipped: {e}')
-
-    # reg_tif_chan2/ holds the non-functional channel (only when nchannels==2)
-    # -------------------------------------------------------
-    if nchannels < 2:
-        return
-
-    other_dir = os.path.join(plane_dir, 'reg_tif_chan2')
-    other_out = f'compiled_Ch{other_chan}.tif'
-    try:
-        print(f'Ch{other_chan} (non-functional, from reg_tif_chan2/)....\n'
-              f'------------')
-        stitch_tiffs_memmap(other_dir, chan=other_chan)
-        print(f'moving {other_out}....')
-        os.rename(os.path.join(other_dir, other_out), other_out)
-    except Exception as e:
-        print(f'Ch{other_chan} skipped: {e}')
+    print('Ch1....\n------------')
+    stitch_tiffs_memmap('suite2p/plane0/reg_tif_chan2', chan=1)
+    print('moving compiled_Ch1.tif....')
+    os.rename('suite2p/plane0/reg_tif_chan2/compiled_Ch1.tif',
+              'compiled_Ch1.tif')
 
     return
 

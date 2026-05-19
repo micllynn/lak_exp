@@ -521,10 +521,8 @@ def _batched_f32(s1, s2, T, batch_size):
     """
     Yield (bi, t0, t1, s1_b, s2_b) as float32 with I/O prefetch.
 
-    Reads the next batch in background threads while the caller
-    processes the current one, hiding disk latency. s1 and s2 are
-    read on separate threads so reads of two distinct files (the
-    typical dual-channel case) overlap rather than serialise.
+    Reads the next batch in a background thread while the caller
+    processes the current one, hiding disk latency.
 
     Parameters
     ----------
@@ -545,31 +543,21 @@ def _batched_f32(s1, s2, T, batch_size):
     """
     n_batches = (T + batch_size - 1) // batch_size
 
-    def _read_one(arr, t0, t1):
-        return arr[t0:t1].astype(np.float32)
+    def _read(t0, t1):
+        return (s1[t0:t1].astype(np.float32),
+                s2[t0:t1].astype(np.float32))
 
-    # Two workers so s1 and s2 reads overlap rather than serialise.
-    # On NVMe / multi-file setups the wall-clock per batch nearly
-    # halves; on single-file / slow buses the GIL release inside
-    # astype still lets the second read start while the first is
-    # mid-copy. Both reads are submitted directly to the pool (not
-    # nested inside another task) so they actually run in parallel.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        def _prefetch(t0, t1):
-            return (pool.submit(_read_one, s1, t0, t1),
-                    pool.submit(_read_one, s2, t0, t1))
-
-        cur_pair = _prefetch(0, min(batch_size, T))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_read, 0, min(batch_size, T))
         for bi in range(n_batches):
             t0 = bi * batch_size
             t1 = min(t0 + batch_size, T)
             if bi + 1 < n_batches:
                 ns = (bi + 1) * batch_size
-                next_pair = _prefetch(ns, min(ns + batch_size, T))
-            s1_b = cur_pair[0].result()
-            s2_b = cur_pair[1].result()
+                next_future = pool.submit(_read, ns, min(ns + batch_size, T))
+            s1_b, s2_b = future.result()
             if bi + 1 < n_batches:
-                cur_pair = next_pair
+                future = next_future
             yield bi, t0, t1, s1_b, s2_b
 
 
@@ -906,164 +894,7 @@ def _correct_robust_time_batched(
     return corrected, coefficients
 
 
-class _DetrendedView(object):
-    """Lazy (T, X, Y) view that subtracts a per-pixel linear trend on read.
-
-    Wraps an underlying (T, X, Y) array (typically a memmap) together with
-    per-pixel intercept `a` and slope `b`. Slicing returns float32 batches
-    with the trend removed, matching the output of
-    detrend_linearly(arr, ...) but without ever materialising the full
-    detrended array on disk or in RAM.
-
-    Supports the indexing patterns used by the correction methods:
-        - view[t0:t1]            -> (bt, X, Y) float32
-        - view[ti]               -> (X, Y) float32
-        - view[:, i_idx, j_idx]  -> (T, chunk_len) float32  (LMS path)
-    """
-
-    def __init__(self, arr, a, b):
-        if a.shape != arr.shape[1:] or b.shape != arr.shape[1:]:
-            raise ValueError(
-                f"a/b shape {a.shape}/{b.shape} does not match "
-                f"arr spatial shape {arr.shape[1:]}")
-        self.arr = arr
-        self.a = a.astype(np.float32, copy=False)
-        self.b = b.astype(np.float32, copy=False)
-        self.shape = arr.shape
-        self.dtype = np.dtype(np.float32)
-        self.ndim = arr.ndim
-        self.nbytes = int(np.prod(arr.shape)) * self.dtype.itemsize
-
-    def __len__(self):
-        return self.shape[0]
-
-    def __getitem__(self, key):
-        if not isinstance(key, tuple):
-            key = (key,)
-        t_key = key[0]
-        sp_key = key[1:]
-
-        base = np.asarray(self.arr[key], dtype=np.float32)
-
-        # Spatial subset of a, b matching the spatial part of the key.
-        if sp_key:
-            a_sub = self.a[sp_key]
-            b_sub = self.b[sp_key]
-        else:
-            a_sub = self.a
-            b_sub = self.b
-
-        T = self.shape[0]
-        if isinstance(t_key, slice):
-            t_vals = np.arange(*t_key.indices(T), dtype=np.float32)
-        elif isinstance(t_key, (int, np.integer)):
-            ti = int(t_key)
-            if ti < 0:
-                ti += T
-            return base - (a_sub + b_sub * np.float32(ti))
-        else:
-            # array / list of indices
-            t_vals = np.asarray(t_key, dtype=np.float32)
-
-        # Broadcast t_vals (n,) over spatial dims of a_sub/b_sub.
-        n_sp = a_sub.ndim
-        t_shape = (t_vals.size,) + (1,) * n_sp
-        trend = a_sub + b_sub * t_vals.reshape(t_shape)
-        return base - trend
-
-    def __array__(self, dtype=None):
-        # Defensive: someone calls np.asarray(view). Materialises full
-        # T*X*Y*4 bytes — only use if you really mean it.
-        out = self[:]
-        return out if dtype is None else out.astype(dtype)
-
-
-def _airpls(y, lam=1e8, porder=1, max_iter=50, tol=1e-3):
-    """Adaptive iteratively reweighted penalised least squares baseline.
-
-    Reference: Zhang, Chen & Liang, Analyst 2010 (airPLS). Estimates a
-    smooth baseline z(t) of a 1-D trace y(t) that lies below the
-    fluorescence transients. Implemented in the Martianova et al.
-    (Sci. Rep. 2021) photometric pipeline; here used on the spatial-
-    mean control / signal traces before the linear regression step.
-
-    Parameters
-    ----------
-    y : np.ndarray, shape (n,)
-        1-D trace (e.g. the spatially-averaged control or signal time
-        series at the recording's sampling rate).
-    lam : float
-        Smoothness penalty on the (porder)-th difference of z. Larger
-        ⇒ smoother baseline. Sensible range 1e6 – 1e10 depending on
-        the sampling rate / drift timescale. Default 1e8.
-    porder : int
-        Order of the difference operator used in the penalty. 1 ≈
-        penalise first-difference (piecewise-linear baseline);
-        2 ≈ penalise curvature. Default 1.
-    max_iter : int
-        Maximum IRLS iterations. Convergence is usually < 20.
-    tol : float
-        Convergence: stop when Σ|d⁻| < tol · Σ|y| where d⁻ are the
-        negative residuals (points below the current baseline).
-
-    Returns
-    -------
-    z : np.ndarray, shape (n,)
-        Estimated baseline.
-    """
-    import scipy.sparse as sp
-    import scipy.sparse.linalg as spla
-
-    _y = np.asarray(y, dtype=np.float64)
-    n = _y.size
-    if n < 3:
-        return _y.copy()
-
-    # Difference operator D of order `porder`. D @ z gives finite
-    # differences; the penalty matrix H = λ · D.T @ D enforces
-    # smoothness of z's porder-th finite difference. Built via
-    # repeated left-multiplication by the first-difference operator
-    # to avoid sparse-matrix row slicing (not supported on all
-    # storage formats).
-    # ----------
-    D = sp.eye(n, format='csc')
-    for _ in range(porder):
-        _m = D.shape[0]
-        _D1 = sp.diags([-1.0, 1.0], [0, 1], shape=(_m - 1, _m),
-                       format='csc')
-        D = _D1 @ D
-    H = (lam * (D.T @ D)).tocsc()
-
-    w = np.ones(n, dtype=np.float64)
-    z = _y.copy()
-    _y_abs_sum = float(np.abs(_y).sum())
-    if _y_abs_sum == 0:
-        return z
-
-    for it in range(1, max_iter + 1):
-        W = sp.diags(w, 0, format='csc')
-        z = spla.spsolve(W + H, w * _y)
-        d = _y - z
-        _neg_mask = d < 0
-        _dn = float(np.abs(d[_neg_mask]).sum())
-        if _dn < tol * _y_abs_sum:
-            break
-        # Reweight: points below the baseline (likely true baseline
-        # samples) get exponentially increasing weight; points above
-        # (transients) get zero weight.
-        _scale = max(_dn, 1e-10)
-        w_new = np.zeros(n, dtype=np.float64)
-        w_new[_neg_mask] = np.exp(it * np.abs(d[_neg_mask]) / _scale)
-        # Anchor endpoints so the baseline tracks edges.
-        _edge = float(np.exp(it * np.abs(d).max() / _scale))
-        w_new[0] = _edge
-        w_new[-1] = _edge
-        w = w_new
-    return z
-
-
-def detrend_linearly(arr, batch_size=500, verbose=False, output_path=None,
-                     return_view=False):
+def detrend_linearly(arr, batch_size=500, verbose=False, output_path=None):
     """
     Remove a per-pixel linear trend from a (T, X, Y) array using two
     streaming temporal passes.
@@ -1089,105 +920,60 @@ def detrend_linearly(arr, batch_size=500, verbose=False, output_path=None,
         If provided, write the detrended output to a raw numpy memmap file
         at this path instead of allocating T*X*Y*4 bytes in RAM.  The
         caller is responsible for deleting the file when no longer needed.
-        Ignored if return_view=True. (default: None)
-    return_view : bool
-        If True, skip pass 2 entirely and return a lazy _DetrendedView
-        that applies the trend at read-time. Eliminates the disk write
-        of the float32 detrended array (~4x the input size) and is the
-        fastest option when the caller will consume the detrended array
-        via slicing (e.g. all correct_signal methods). (default: False)
+        (default: None)
 
     Returns
     -------
-    out : np.ndarray, np.memmap, or _DetrendedView
-        Linearly detrended array, shape (T, X, Y), dtype float32. When
-        return_view=True, returns a _DetrendedView wrapper around the
-        original arr instead of a materialised array.
+    out : np.ndarray or np.memmap
+        Linearly detrended array, shape (T, X, Y), dtype float32.
     """
     T, X, Y = arr.shape
     n_pixels = X * Y
     n_batches = (T + batch_size - 1) // batch_size
 
-    # Closed-form OLS coefficients only depend on time indices, so build
-    # them in float64 once for full precision, then drop to float32 for
-    # per-batch work.
-    t_arr_f32 = np.arange(T, dtype=np.float32)
-    mean_t = (T - 1) / 2.0
-    sum_t2 = T * (T - 1) * (2 * T - 1) / 6.0
-    denom = sum_t2 - T * mean_t ** 2
-
-    # One-worker prefetch: disk read of batch i+1 overlaps with CPU work
-    # on batch i, matching the pattern used by _batched_f32.
-    def _read_f32(t0, t1):
-        return np.asarray(arr[t0:t1], dtype=np.float32)
+    t_arr = np.arange(T, dtype=np.float64)
+    mean_t = (T - 1) / 2.0                          # exact mean of 0..T-1
+    sum_t2 = T * (T - 1) * (2 * T - 1) / 6.0       # exact sum of t^2
+    denom = sum_t2 - T * mean_t ** 2                 # T * Var(t), scalar
 
     # ------------------------------------------------------------------
-    # Pass 1: accumulate per-pixel sum(y) and sum(t*y).
-    # Convert batch to float32 (half the memory traffic and ~2x BLAS
-    # throughput vs float64); accumulate per-batch (P,) reductions into
-    # float64 to preserve precision across the full T.
+    # Pass 1: accumulate per-pixel sum(y) and sum(t*y)
     # ------------------------------------------------------------------
+    if verbose:
+        print(f'\t\t\tdetrend pass 1/2 ({n_batches} batches)...', end='\r')
     sum_y = np.zeros(n_pixels, dtype=np.float64)
     sum_ty = np.zeros(n_pixels, dtype=np.float64)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_read_f32, 0, min(batch_size, T))
-        for bi in range(n_batches):
-            t0 = bi * batch_size
-            t1 = min(t0 + batch_size, T)
-            if bi + 1 < n_batches:
-                ns = (bi + 1) * batch_size
-                next_future = pool.submit(
-                    _read_f32, ns, min(ns + batch_size, T))
-            batch = future.result().reshape(t1 - t0, -1)
-            if bi + 1 < n_batches:
-                future = next_future
-            # (P,) reductions in float32, promoted on accumulate.
-            sum_y += batch.sum(axis=0, dtype=np.float64)
-            sum_ty += (t_arr_f32[t0:t1] @ batch).astype(np.float64)
-            if verbose:
-                print(f'\t\t\tdetrend batch {bi + 1}/{n_batches}...',
-                      end='\r')
+    for bi in range(n_batches):
+        t0 = bi * batch_size
+        t1 = min(t0 + batch_size, T)
+        batch = np.asarray(
+            arr[t0:t1], dtype=np.float64).reshape(t1 - t0, -1)  # (bt, P)
+        sum_y += batch.sum(axis=0)
+        sum_ty += t_arr[t0:t1] @ batch    # (P,) via BLAS DGEMV, no large tmp
 
     mean_y = sum_y / T
-    b = ((sum_ty / T) - mean_t * mean_y) / (denom / T)
-    a = mean_y - b * mean_t
+    b = ((sum_ty / T) - mean_t * mean_y) / (denom / T)   # slope (P,)
+    a = mean_y - b * mean_t                               # intercept (P,)
     a = a.astype(np.float32).reshape(X, Y)
     b = b.astype(np.float32).reshape(X, Y)
     del sum_y, sum_ty, mean_y
 
-    if return_view:
-        if verbose:
-            print('\t\t\tdetrend done (lazy view, no pass 2)             ')
-        return _DetrendedView(arr, a, b)
-
     # ------------------------------------------------------------------
-    # Pass 2: subtract per-pixel trend, write float32 output. Prefetch
-    # the next batch while we subtract+write the current one — hides
-    # disk read latency behind the (write-bound) output stage.
+    # Pass 2: subtract per-pixel trend, write float32 output
     # ------------------------------------------------------------------
+    if verbose:
+        print(f'\t\t\tdetrend pass 2/2 ({n_batches} batches)...', end='\r')
     if output_path is not None:
         out = np.memmap(output_path, dtype=np.float32, mode='w+',
                         shape=(T, X, Y))
     else:
         out = np.empty((T, X, Y), dtype=np.float32)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_read_f32, 0, min(batch_size, T))
-        for bi in range(n_batches):
-            t0 = bi * batch_size
-            t1 = min(t0 + batch_size, T)
-            if bi + 1 < n_batches:
-                ns = (bi + 1) * batch_size
-                next_future = pool.submit(
-                    _read_f32, ns, min(ns + batch_size, T))
-            batch = future.result()
-            if bi + 1 < n_batches:
-                future = next_future
-            t_b = t_arr_f32[t0:t1]
-            out[t0:t1] = batch - (
-                a + b * t_b[:, np.newaxis, np.newaxis])
-            if verbose:
-                print(f'\t\t\tdetrend (apply) batch '
-                      f'{bi + 1}/{n_batches}...', end='\r')
+    for bi in range(n_batches):
+        t0 = bi * batch_size
+        t1 = min(t0 + batch_size, T)
+        batch = np.asarray(arr[t0:t1], dtype=np.float32)         # (bt, X, Y)
+        t_b = t_arr[t0:t1].astype(np.float32)                    # (bt,)
+        out[t0:t1] = batch - (a + b * t_b[:, np.newaxis, np.newaxis])
     if output_path is not None:
         out.flush()
 
@@ -1269,893 +1055,6 @@ def correct_linear_regression(
             s1, s2, batch_size, huber_epsilon, max_iter, tol, dtype,
             verbose, output_path
         )
-
-
-def correct_linear_photometric(
-        s1, s2, batch_size=1000, dtype=np.float16, verbose=True,
-        output_path=None, eps=1e-6, global_fit=True):
-    """
-    Photometric-style pixel-wise correction.
-
-    Implements the dual-channel photometric correction described in
-    Martianova, Aronson & Proulx (Sci. Rep. 2021,
-    https://www.nature.com/articles/s41598-021-03626-9): the control
-    channel s1 (here the green channel, treated as an isosbestic-like
-    reference) is linearly fit to the signal channel s2 (here the red
-    channel) by ordinary least squares per pixel, the fitted control
-    is used as the baseline F0 to compute dF/F = (s2 − F̂)/F̂ per pixel,
-    and the resulting dF/F is z-scored per pixel across time.
-
-    Three streaming temporal passes:
-        pass 1 — Σs1, Σs2, Σs1², Σs1s2 → per-pixel OLS coefficients
-                 (β0, β1)
-        pass 2 — accumulate Σx, Σx² of x = (s2 − (β0+β1·s1)) /
-                 (β0+β1·s1) → per-pixel mean/std
-        pass 3 — write z = (x − µ) / σ per batch to output
-
-    Parameters
-    ----------
-    s1 : np.ndarray or memmap
-        Control signal (here grn channel, isosbestic-like reference),
-        shape (T, X, Y).
-    s2 : np.ndarray or memmap
-        Real signal to correct (here red channel), shape (T, X, Y).
-    batch_size : int
-        Number of time frames per streaming batch. Larger is faster but
-        uses more RAM. Default 1000.
-    dtype : np.dtype
-        Output dtype. Default np.float16 — z-scored dF/F values live in
-        a small dynamic range (~[-5, 5]) and float16 halves RAM use vs
-        float32 with ample precision for visualisation and downstream
-        z-score arithmetic. Pass np.float32 for max precision; pass
-        np.int16 with care (precision loss).
-    verbose : bool
-        If True, print progress updates. Default True.
-    output_path : str, optional
-        If provided, write the corrected output to this path as a
-        memory-mapped TIFF file instead of storing in RAM. Default None.
-    eps : float
-        Small floor added to the fitted control F̂ to avoid division by
-        zero in pixels where the fit happens to be near zero. Default
-        1e-6.
-    global_fit : bool
-        If True (default), fit β₀, β₁ as scalars from the spatially-
-        averaged time series s̄1(t), s̄2(t) — one OLS line shared across
-        all pixels (closer to the paper's fiber-photometry semantics
-        and more robust to per-pixel SNR variation). If False, fit
-        per-pixel: each pixel gets its own β₀(x, y), β₁(x, y) from its
-        own time series. dF/F and z-score are always computed per pixel.
-
-    Returns
-    -------
-    corrected : np.ndarray or memmap, shape (T, X, Y)
-        Per-pixel z-scored dF/F using the linearly-fit control as F0.
-    coefficients : np.ndarray, shape (X, Y, 2)
-        OLS regression coefficients [β₀, β₁] per pixel (float32). When
-        global_fit=True, every pixel carries the same scalar values.
-    """
-    if s1.shape != s2.shape:
-        raise ValueError(
-            f"s1 and s2 must have same shape, "
-            f"got {s1.shape} and {s2.shape}")
-
-    T, X, Y = s1.shape
-    s1, s2, batch_size = _prepare_inputs(
-        s1, s2, batch_size, T, X, Y, verbose)
-    n_batches = (T + batch_size - 1) // batch_size
-
-    disk_str = " -> disk" if output_path else ""
-    if verbose:
-        print(f'\tcorrecting signal (linear photometric{disk_str})...')
-
-    # Pre-allocate output (float32 in RAM, or float32 memmap on disk).
-    # ----------
-    if output_path is not None:
-        if verbose:
-            print(f'\t\twriting output to: {output_path}')
-        corrected = tifffile.memmap(
-            output_path, shape=(T, X, Y), dtype=dtype, bigtiff=True)
-    else:
-        corrected = np.zeros((T, X, Y), dtype=dtype)
-    coefficients = np.zeros((X, Y, 2), dtype=np.float32)
-
-    # Pass 1 — one-pass statistics → OLS coefficients.
-    # global_fit=True : single scalar β₀, β₁ from the spatially-averaged
-    #                   time series s̄1(t), s̄2(t).
-    # global_fit=False: per-pixel β₀(x, y), β₁(x, y).
-    # ----------
-    if verbose:
-        _mode = 'global' if global_fit else 'per-pixel'
-        print(f'\t\tpass 1/3: regression coefficients [{_mode}] '
-              f'({n_batches} time batches)...')
-
-    if global_fit:
-        sbar1_sum      = 0.0
-        sbar2_sum      = 0.0
-        sbar1sq_sum    = 0.0
-        sbar1sbar2_sum = 0.0
-    else:
-        s1_sum   = np.zeros((X, Y), dtype=np.float64)
-        s2_sum   = np.zeros((X, Y), dtype=np.float64)
-        s1sq_sum = np.zeros((X, Y), dtype=np.float64)
-        s1s2_sum = np.zeros((X, Y), dtype=np.float64)
-
-    for bi, t_start, t_end, s1_b, s2_b in _batched_f32(
-            s1, s2, T, batch_size):
-        if verbose:
-            pct = (bi + 1) / n_batches * 100
-            print(f'\t\t\tbatch {bi+1}/{n_batches} ({pct:.1f}%)...',
-                  end='\r')
-        if global_fit:
-            # Spatial means per timepoint, then accumulate scalar sums.
-            _s1bar = s1_b.mean(axis=(1, 2), dtype=np.float64)  # (b,)
-            _s2bar = s2_b.mean(axis=(1, 2), dtype=np.float64)  # (b,)
-            sbar1_sum      += float(_s1bar.sum())
-            sbar2_sum      += float(_s2bar.sum())
-            sbar1sq_sum    += float((_s1bar * _s1bar).sum())
-            sbar1sbar2_sum += float((_s1bar * _s2bar).sum())
-        else:
-            s1_sum   += s1_b.sum(axis=0, dtype=np.float64)
-            s2_sum   += s2_b.sum(axis=0, dtype=np.float64)
-            s1sq_sum += (s1_b * s1_b).sum(axis=0, dtype=np.float64)
-            s1s2_sum += (s1_b * s2_b).sum(axis=0, dtype=np.float64)
-
-    if verbose:
-        print(f'\t\t\tbatch {n_batches}/{n_batches} (100.0%)...done      ')
-
-    if global_fit:
-        _mean_s1_bar = sbar1_sum / T
-        _mean_s2_bar = sbar2_sum / T
-        _var_s1_bar = max(
-            sbar1sq_sum / T - _mean_s1_bar ** 2, 1e-10)
-        _cov_s1s2_bar = (sbar1sbar2_sum / T
-                         - _mean_s1_bar * _mean_s2_bar)
-        beta1 = np.float32(_cov_s1s2_bar / _var_s1_bar)        # scalar
-        beta0 = np.float32(
-            _mean_s2_bar - float(beta1) * _mean_s1_bar)        # scalar
-        coefficients[:, :, 0] = beta0
-        coefficients[:, :, 1] = beta1
-        if verbose:
-            print(f'\t\t\tβ₀ = {float(beta0):.6g}, '
-                  f'β₁ = {float(beta1):.6g}')
-    else:
-        mean_s1  = s1_sum / T
-        mean_s2  = s2_sum / T
-        var_s1   = np.maximum(s1sq_sum / T - mean_s1 ** 2, 1e-10)
-        cov_s1s2 = s1s2_sum / T - mean_s1 * mean_s2
-        beta1 = (cov_s1s2 / var_s1).astype(np.float32)         # (X, Y)
-        beta0 = (mean_s2 - beta1 * mean_s1).astype(np.float32) # (X, Y)
-        coefficients[:, :, 0] = beta0
-        coefficients[:, :, 1] = beta1
-        del s1_sum, s2_sum, s1sq_sum, s1s2_sum
-        del mean_s1, mean_s2, var_s1, cov_s1s2
-
-    # Pass 2 — accumulate Σx, Σx² of x = (s2 − F̂) / F̂ across time
-    # for per-pixel mean and std used by the z-score in pass 3.
-    # In-place arithmetic on the prefetched s1_b / s2_b buffers — the
-    # same buffer-reuse trick pass 3 already uses, but applied here to
-    # cut ~3 GB of per-batch temporaries (_fhat, _denom, _dff each
-    # used to allocate a fresh (b, X, Y) float32 array).
-    # ----------
-    if verbose:
-        print(f'\t\tpass 2/3: dF/F mean/std '
-              f'({n_batches} time batches)...')
-
-    dff_sum   = np.zeros((X, Y), dtype=np.float64)
-    dffsq_sum = np.zeros((X, Y), dtype=np.float64)
-
-    for bi, t_start, t_end, s1_b, s2_b in _batched_f32(
-            s1, s2, T, batch_size):
-        if verbose:
-            pct = (bi + 1) / n_batches * 100
-            print(f'\t\t\tbatch {bi+1}/{n_batches} ({pct:.1f}%)...',
-                  end='\r')
-        # F̂ in s1_b: s1_b ← β₀ + β₁·s1_b
-        np.multiply(s1_b, beta1, out=s1_b)
-        s1_b += beta0
-        # Floor |F̂| at eps with sign preserved (zeros → positive).
-        _sign = np.sign(s1_b)
-        _sign[_sign == 0] = 1.0
-        np.abs(s1_b, out=s1_b)
-        np.maximum(s1_b, eps, out=s1_b)
-        s1_b *= _sign
-        del _sign
-        # ΔF/F in s2_b: s2_b ← (s2_b − F̂) / F̂
-        s2_b -= s1_b
-        np.divide(s2_b, s1_b, out=s2_b)
-        # Accumulate moments
-        dff_sum   += s2_b.sum(axis=0, dtype=np.float64)
-        dffsq_sum += np.einsum('ijk,ijk->jk', s2_b, s2_b,
-                               dtype=np.float64)
-
-    if verbose:
-        print(f'\t\t\tbatch {n_batches}/{n_batches} (100.0%)...done      ')
-
-    mean_dff = (dff_sum / T).astype(np.float32)
-    var_dff  = np.maximum(dffsq_sum / T - mean_dff ** 2, 1e-10)
-    std_dff  = np.sqrt(var_dff).astype(np.float32)
-    del dff_sum, dffsq_sum, var_dff
-
-    # Pass 3 — write z-scored dF/F per batch. To minimise peak RAM
-    # (the output buffer is already T*X*Y*itemsize and the user runs
-    # on a constrained machine), reuse the batched s1_b/s2_b buffers
-    # in place via numpy `out=` so no per-batch full-volume temporaries
-    # are allocated.
-    # ----------
-    if verbose:
-        print(f'\t\tpass 3/3: writing z-scored dF/F '
-              f'({n_batches} time batches)...')
-
-    for bi, t_start, t_end, s1_b, s2_b in _batched_f32(
-            s1, s2, T, batch_size):
-        if verbose:
-            pct = (bi + 1) / n_batches * 100
-            print(f'\t\t\tbatch {bi+1}/{n_batches} ({pct:.1f}%)...',
-                  end='\r')
-        # F̂ in s1_b: s1_b ← β₀ + β₁·s1_b
-        np.multiply(s1_b, beta1, out=s1_b)
-        s1_b += beta0
-        # Protect division: floor |F̂| at eps, preserving sign. Promote
-        # exact zeros to +1 in the sign array so the |F̂| floor isn't
-        # nullified when np.sign returns 0.
-        _sign = np.sign(s1_b)
-        _sign[_sign == 0] = 1.0
-        np.abs(s1_b, out=s1_b)
-        np.maximum(s1_b, eps, out=s1_b)
-        s1_b *= _sign
-        del _sign
-        # dF/F in s2_b: s2_b ← (s2_b − F̂) / F̂
-        s2_b -= s1_b
-        np.divide(s2_b, s1_b, out=s2_b)
-        # z-score in place
-        s2_b -= mean_dff
-        s2_b /= std_dff
-        corrected[t_start:t_end] = _clip_to_dtype(s2_b, dtype)
-
-    if verbose:
-        print(f'\t\t\tbatch {n_batches}/{n_batches} (100.0%)...done      ')
-
-    if output_path is not None:
-        corrected.flush()
-        if verbose:
-            print('\t\tflushed output to disk')
-
-    return corrected, coefficients
-
-
-def correct_linear_martianova_1d(
-        s1, s2,
-        smooth_window=10,
-        airpls_lam=1e5, airpls_porder=2, airpls_max_iter=50,
-        trim_initial=0,
-        nn_slope=True,
-        verbose=True):
-    """1-D variant of ``correct_linear_martianova``.
-
-    Operates on two length-T 1-D traces (s1 = control / regressor,
-    s2 = signal) and returns the corrected trace
-
-        zdFF(t) = s2_norm(t) − β · s1_norm(t)
-
-    in z-score units, following steps 1–5 of the Martianova et al.
-    (2021) photometric pipeline. Use case: hemisphere-control 2-photon
-    runs where one hemisphere expresses GRAB-5HT (s2) and the other
-    a non-binding mutant (s1); the mut trace is treated as the
-    isosbestic-like reference.
-
-    Equivalent to taking the spatial-mean of the pixel-wise pipeline
-    and skipping Phase B (per-voxel normalisation + per-voxel
-    subtraction). The β is fit on the trim-warmup window but applied
-    to the full T frames.
-
-    Parameters
-    ----------
-    s1, s2 : array-like, shape (T,)
-        Control and signal traces at the imaging sampling rate.
-    smooth_window : int
-        Moving-average window applied to both traces before airPLS.
-        Default 10 (paper). Set to 1 to disable.
-    airpls_lam : float
-        airPLS smoothness penalty. Default 1e5.
-    airpls_porder : int
-        airPLS difference order. Default 2 (curvature-penalising).
-    airpls_max_iter : int
-        Max IRLS iterations for airPLS. Default 50.
-    trim_initial : int
-        Drop this many leading frames from the regression fit window.
-        The full-length output still spans all T frames. Default 0.
-    nn_slope : bool
-        If True (default), enforce β ≥ 0.
-    verbose : bool
-        Print the fitted β, σ, m diagnostics.
-
-    Returns
-    -------
-    corrected : np.ndarray, shape (T,), dtype float32
-        z-scored, β-subtracted signal trace.
-    beta : float
-        Fitted slope on the normalised fit traces.
-    """
-    s1 = np.asarray(s1, dtype=np.float64).ravel()
-    s2 = np.asarray(s2, dtype=np.float64).ravel()
-    if s1.shape != s2.shape:
-        raise ValueError(
-            f's1 and s2 must have same length, got {s1.shape} '
-            f'and {s2.shape}')
-    T = s1.size
-    if T < 4:
-        raise ValueError(
-            f'traces too short for 1D Martianova fit (T={T})')
-
-    # 1. Moving-average lowpass
-    # ----------
-    def _moving_average(x, w):
-        if w <= 1:
-            return np.asarray(x, dtype=np.float64)
-        _w = int(w)
-        _pad = _w // 2
-        _xp = np.pad(x, _pad, mode='edge')
-        _kernel = np.ones(_w, dtype=np.float64) / _w
-        return np.convolve(_xp, _kernel, mode='same')[_pad:_pad + len(x)]
-
-    s1_sm = _moving_average(s1, smooth_window)
-    s2_sm = _moving_average(s2, smooth_window)
-
-    # 2. airPLS baselines
-    # ----------
-    if verbose:
-        print('\t\t1d-martianova: running airPLS baselines on s1(t), '
-              's2(t)...')
-    b1 = _airpls(s1_sm, lam=airpls_lam, porder=airpls_porder,
-                 max_iter=airpls_max_iter)
-    b2 = _airpls(s2_sm, lam=airpls_lam, porder=airpls_porder,
-                 max_iter=airpls_max_iter)
-
-    # 3. Trim warm-up — restricts only the regression fit window;
-    # the corrected output still spans all T frames.
-    # ----------
-    _t0 = int(max(0, min(trim_initial, T - 2)))
-    s1_fit = s1_sm[_t0:] - b1[_t0:]
-    s2_fit = s2_sm[_t0:] - b2[_t0:]
-
-    # 4. Per-channel median-subtract + std-divide normalisation
-    # ----------
-    m1 = float(np.median(s1_fit))
-    m2 = float(np.median(s2_fit))
-    std1 = float(np.std(s1_fit))
-    std2 = float(np.std(s2_fit))
-    std1 = std1 if std1 > 1e-10 else 1.0
-    std2 = std2 if std2 > 1e-10 else 1.0
-    s1_norm_fit = (s1_fit - m1) / std1
-    s2_norm_fit = (s2_fit - m2) / std2
-
-    # 5. Non-negative OLS slope on normalised fit traces
-    # ----------
-    _mn1 = float(np.mean(s1_norm_fit))
-    _mn2 = float(np.mean(s2_norm_fit))
-    _var1 = max(float(np.var(s1_norm_fit)), 1e-10)
-    _cov12 = float(np.mean(s1_norm_fit * s2_norm_fit) - _mn1 * _mn2)
-    beta_pre = _cov12 / _var1
-    if nn_slope and beta_pre < 0:
-        beta = 0.0
-    else:
-        beta = beta_pre
-
-    if verbose:
-        print(f'\t\t\tβ = {beta:.6g} (raw fit {beta_pre:.6g}, '
-              f'nn={"on" if nn_slope else "off"})')
-        print(f'\t\t\tσ1 = {std1:.4g}, σ2 = {std2:.4g}, '
-              f'm1 = {m1:.4g}, m2 = {m2:.4g}')
-
-    # Apply over the full T-frame trace: normalise using fit-window
-    # stats, then subtract β·s1_norm. Matches Phase B of the pixel-
-    # wise version reduced to a single 1-D pixel.
-    # ----------
-    s1_full = s1_sm - b1
-    s2_full = s2_sm - b2
-    s1_full_norm = (s1_full - m1) / std1
-    s2_full_norm = (s2_full - m2) / std2
-    corrected = s2_full_norm - beta * s1_full_norm
-    return corrected.astype(np.float32), float(beta)
-
-
-def correct_linear_martianova(
-        s1, s2, batch_size=1000, dtype=np.float16, verbose=True,
-        output_path=None, eps=1e-6,
-        smooth_window=10,
-        airpls_lam=1e5, airpls_porder=2, airpls_max_iter=50,
-        trim_initial=0,
-        nn_slope=True, per_pixel_offset=True,
-        fast_stats=True, aggregates_only=None,
-        fit_mode='global'):
-    """
-    Faithful Martianova et al. (2021) photometric correction.
-
-    Implements the exact pipeline from the published reference code
-    (https://github.com/katemartian/Photometry_data_processing —
-    function ``get_zdFF``):
-
-        1. moving-average lowpass on spatial-mean control & signal
-        2. airPLS baseline removal per channel
-        3. drop the first `trim_initial` warm-up frames
-        4. per-channel median-subtract + std-divide normalisation
-        5. non-negative OLS slope of normalised signal on normalised
-           reference (one scalar β shared across the FOV)
-        6. **per-voxel** normalisation: each pixel is rescaled to its
-           own session mean + std before the subtraction. This adapts
-           the paper's per-trace algorithm to the spatial 2-photon
-           setting without re-fitting β per pixel.
-        7. zdFF(t, x, y) = s2_norm(t, x, y) − β · s1_norm(t, x, y)
-           — a **subtraction** in normalised space, matching the
-           reference implementation. The output is approximately
-           N(0, √(1 − β²)) in z-score units; signals unique to s2 are
-           preserved at their full normalised magnitude, while
-           features shared with s1 are attenuated by (1 − β).
-
-    Steps 1–5 operate on length-T 1-D arrays (cheap, no batching).
-    Steps 6–7 stream over the 3-D stack in two passes (one to collect
-    per-pixel session moments, one to compute and write/aggregate
-    zdFF). The previous "(s2 − F̂)/F̂ then z-score per pixel"
-    formulation has been removed — it was not in the reference paper
-    and produced near-zero output in regimes where β cleanly explained
-    s2's coupling to s1, even when s2 had transient features absent
-    from s1.
-
-    Parameters
-    ----------
-    s1 : np.ndarray or memmap, shape (T, X, Y)
-        Control / isosbestic-like reference channel (e.g. green).
-    s2 : np.ndarray or memmap, shape (T, X, Y)
-        Real signal to be corrected (e.g. red).
-    batch_size : int
-        Frames per streaming batch. Default 1000.
-    dtype : np.dtype
-        Output dtype. Default np.float16 (z-scored output, ~[-5, 5]
-        dynamic range; halves RAM vs float32).
-    verbose : bool
-        Print progress + the fitted β values + airPLS iteration count.
-    output_path : str or None
-        If given, write the corrected stack to a memory-mapped TIFF
-        instead of a RAM buffer.
-    eps : float
-        Floor for |F̂| to protect the per-pixel divide-by-zero.
-    smooth_window : int
-        Moving-average window applied to s̄1(t), s̄2(t) before airPLS.
-        Default 10 (paper). Set to 1 to disable.
-    airpls_lam : float
-        airPLS smoothness penalty (large ⇒ smoother baseline). Default
-        1e5 — works well with porder=2 across slow-drift timescales
-        typical of 2-photon recordings. Increase if the baseline tracks
-        transients; decrease if it under-fits slow drift.
-    airpls_porder : int
-        airPLS difference order. 1 penalises change (baseline tends to
-        flat), 2 penalises curvature (baseline tends to piecewise-
-        linear — recovers slow sinusoidal drift well). Default 2.
-    airpls_max_iter : int
-        IRLS iteration cap for airPLS. Default 50.
-    trim_initial : int
-        Drop this many leading frames from the 1-D fit (the paper uses
-        200 for fiber photometry). Default 0; the full-stack output
-        still spans all T frames — only the regression is fit on the
-        trimmed window.
-    nn_slope : bool
-        If True (default, matches paper), enforce β₁ ≥ 0 — physically
-        the isosbestic-like control only *adds* fluorescence.
-    per_pixel_offset : bool
-        Accepted for API compatibility but no longer used. The
-        subtraction formula derives its per-pixel anchor from the
-        per-voxel normalisation (m_xy, σ_xy) directly. Default True.
-    fast_stats : bool
-        Accepted for API compatibility but no longer used. The pipeline
-        now runs in two streaming passes regardless of this flag (the
-        previous fast_stats=False path computed σ of ΔF/F-from-division
-        empirically in a third pass; the division formula is gone, so
-        there is nothing to approximate). Default True.
-    fit_mode : str
-        How β is fit and applied:
-        - 'global' (default): one scalar β from OLS on the spatial-
-          mean normalised traces, applied uniformly to every pixel.
-          Paper-faithful (matches Martianova's 1-D photometry pipeline
-          exactly).
-        - 'per_pixel': β_xy = per-pixel Pearson correlation between
-          s1 and s2. Adapts the subtraction strength to local
-          coupling; recommended for 2-photon spatial data where the
-          coupling varies across the FOV and a single global β
-          systematically over-subtracts at low-coupling pixels
-          (visible as strongly negative spatial Pearson between
-          red_corr and grn sector maps).
-    aggregates_only : dict or None
-        If a dict (e.g. ``{'n_sectors': 8}``), skip the (T, X, Y)
-        output buffer entirely and stream-compute the whole-frame
-        mean and per-sector mean of z-scored ΔF/F directly per batch.
-        Returns those aggregates in lieu of the full corrected stack.
-        Eliminates the 14 GB allocation + 14 GB write that otherwise
-        dominate RAM and disk I/O for the QC-pipeline use case. The
-        per-sector partitioning mirrors `QCMixin._compute_sectors`:
-        the FOV is trimmed to (X//n_sec)*n_sec × (Y//n_sec)*n_sec and
-        carved into uniform n_sec × n_sec blocks. Default None
-        (returns the full (T, X, Y) corrected stack as before).
-
-    Returns
-    -------
-    corrected : np.ndarray, memmap, or dict
-        Per-pixel z-scored ΔF/F, shape (T, X, Y), dtype is the `dtype`
-        argument. When ``aggregates_only`` is set, instead returns
-        ``{'frame_f': (T,), 'sector_f': (n_sectors², T), 'n_sectors':
-        int, 'is_aggregates': True}`` — a small dict with the
-        whole-frame and per-sector mean z-score traces.
-    coefficients : np.ndarray, shape (X, Y, 2)
-        Float32. Slot 0 carries the per-pixel session mean of
-        (s2 − b2) — the natural per-pixel "intercept" of the implicit
-        linear fit s2 ≈ β₀_xy + β₁·s1 in raw units, useful as a
-        diagnostic. Slot 1 carries the global β₁ (same scalar across
-        the FOV), the OLS slope on the normalised spatial-mean traces.
-    """
-    if s1.shape != s2.shape:
-        raise ValueError(
-            f"s1 and s2 must have same shape, "
-            f"got {s1.shape} and {s2.shape}")
-
-    T, X, Y = s1.shape
-    s1, s2, batch_size = _prepare_inputs(
-        s1, s2, batch_size, T, X, Y, verbose)
-    n_batches = (T + batch_size - 1) // batch_size
-
-    # Aggregates-only mode: skip the full (T, X, Y) output and stream-
-    # compute whole-frame + per-sector means of z-scored ΔF/F directly.
-    # Mirrors QCMixin._compute_sectors' partitioning: trim the FOV to
-    # divisible dims, then carve into uniform n_sec × n_sec blocks.
-    # ----------
-    _aggregates = aggregates_only is not None
-    if _aggregates:
-        if output_path is not None:
-            raise ValueError(
-                "aggregates_only and output_path are mutually exclusive")
-        _n_sec = int(aggregates_only.get('n_sectors', 8))
-        _Ly_t = (X // _n_sec) * _n_sec
-        _Lx_t = (Y // _n_sec) * _n_sec
-        _by = _Ly_t // _n_sec
-        _bx = _Lx_t // _n_sec
-        agg_frame_f = np.zeros(T, dtype=np.float32)
-        agg_sector_f = np.zeros(
-            (_n_sec * _n_sec, T), dtype=np.float32)
-
-    disk_str = " -> disk" if output_path else ""
-    _flags = []
-    if _aggregates:
-        _flags.append(f'aggregates n_sec={_n_sec}')
-    mode_tag = f' [{", ".join(_flags)}]' if _flags else ''
-    if verbose:
-        print(f'\tcorrecting signal '
-              f'(linear martianova{disk_str}){mode_tag}...')
-
-    # Pre-allocate output and coefficient map.
-    # ----------
-    if _aggregates:
-        corrected = None
-    elif output_path is not None:
-        if verbose:
-            print(f'\t\twriting output to: {output_path}')
-        corrected = tifffile.memmap(
-            output_path, shape=(T, X, Y), dtype=dtype, bigtiff=True)
-    else:
-        corrected = np.zeros((T, X, Y), dtype=dtype)
-    coefficients = np.zeros((X, Y, 2), dtype=np.float32)
-
-    # ------------------------------------------------------------------
-    # Pass 1 — single streaming read of s1, s2. Collects:
-    #   • spatial-mean 1-D traces s̄1(t), s̄2(t)  → phase A (airPLS, β)
-    #   • per-pixel session means Σs1, Σs2       → per-pixel m_xy
-    #   • per-pixel second moments Σs1², Σs2², Σs1·s2 → per-pixel σ_xy
-    # All later arithmetic is computed from these accumulators — no
-    # second read of s1, s2 needed before the writing pass.
-    # ------------------------------------------------------------------
-    if verbose:
-        print(f'\t\tpass 1/2: spatial means & per-pixel moments '
-              f'({n_batches} time batches)...')
-
-    sbar1 = np.zeros(T, dtype=np.float64)
-    sbar2 = np.zeros(T, dtype=np.float64)
-    pix_sum_s1 = np.zeros((X, Y), dtype=np.float64)
-    pix_sum_s2 = np.zeros((X, Y), dtype=np.float64)
-    pix_sum_s1sq = np.zeros((X, Y), dtype=np.float64)
-    pix_sum_s2sq = np.zeros((X, Y), dtype=np.float64)
-    pix_sum_s1s2 = np.zeros((X, Y), dtype=np.float64)
-
-    for bi, t_start, t_end, s1_b, s2_b in _batched_f32(
-            s1, s2, T, batch_size):
-        if verbose:
-            pct = (bi + 1) / n_batches * 100
-            print(f'\t\t\tbatch {bi+1}/{n_batches} ({pct:.1f}%)...',
-                  end='\r')
-        sbar1[t_start:t_end] = s1_b.mean(axis=(1, 2), dtype=np.float64)
-        sbar2[t_start:t_end] = s2_b.mean(axis=(1, 2), dtype=np.float64)
-        pix_sum_s1 += s1_b.sum(axis=0, dtype=np.float64)
-        pix_sum_s2 += s2_b.sum(axis=0, dtype=np.float64)
-        pix_sum_s1sq += np.einsum(
-            'ijk,ijk->jk', s1_b, s1_b, dtype=np.float64)
-        pix_sum_s2sq += np.einsum(
-            'ijk,ijk->jk', s2_b, s2_b, dtype=np.float64)
-        pix_sum_s1s2 += np.einsum(
-            'ijk,ijk->jk', s1_b, s2_b, dtype=np.float64)
-
-    if verbose:
-        print(f'\t\t\tbatch {n_batches}/{n_batches} (100.0%)...done      ')
-
-    pix_mean_s1 = (pix_sum_s1 / T).astype(np.float32)
-    pix_mean_s2 = (pix_sum_s2 / T).astype(np.float32)
-    # Per-pixel time-variances from Σx² and (Σx)² accumulators.
-    # Float64 inside, float32 outside — keeps the subtraction
-    # numerically stable for big T.
-    pix_var_s1 = np.maximum(
-        pix_sum_s1sq / T
-        - pix_mean_s1.astype(np.float64) ** 2, 1e-10).astype(np.float32)
-    pix_var_s2 = np.maximum(
-        pix_sum_s2sq / T
-        - pix_mean_s2.astype(np.float64) ** 2, 1e-10).astype(np.float32)
-    pix_cov_s1s2 = (
-        pix_sum_s1s2 / T
-        - pix_mean_s1.astype(np.float64)
-        * pix_mean_s2.astype(np.float64)).astype(np.float32)
-    del pix_sum_s1, pix_sum_s2
-    del pix_sum_s1sq, pix_sum_s2sq, pix_sum_s1s2
-
-    # ------------------------------------------------------------------
-    # Phase A — 1-D Martianova pipeline on the spatial-mean traces.
-    # ------------------------------------------------------------------
-
-    # 1. Lowpass moving-average smoothing.
-    # ----------
-    def _moving_average(x, w):
-        if w <= 1:
-            return np.asarray(x, dtype=np.float64)
-        _w = int(w)
-        # Reflect-pad so the smoothed trace stays length-T.
-        _pad = _w // 2
-        _xp = np.pad(np.asarray(x, dtype=np.float64), _pad, mode='edge')
-        _kernel = np.ones(_w, dtype=np.float64) / _w
-        return np.convolve(_xp, _kernel, mode='same')[_pad:_pad + len(x)]
-
-    sbar1_sm = _moving_average(sbar1, smooth_window)
-    sbar2_sm = _moving_average(sbar2, smooth_window)
-
-    # 2. airPLS baseline per channel.
-    # ----------
-    if verbose:
-        print('\t\trunning airPLS baselines on s̄1(t), s̄2(t)...')
-    b1 = _airpls(sbar1_sm, lam=airpls_lam, porder=airpls_porder,
-                 max_iter=airpls_max_iter)
-    b2 = _airpls(sbar2_sm, lam=airpls_lam, porder=airpls_porder,
-                 max_iter=airpls_max_iter)
-
-    # 3. Trim warm-up — applies only to the regression fit window;
-    # the full T-frame output is still written.
-    # ----------
-    _t0 = int(max(0, min(trim_initial, T - 2)))
-    sbar1_corr = sbar1_sm[_t0:] - b1[_t0:]
-    sbar2_corr = sbar2_sm[_t0:] - b2[_t0:]
-
-    # 4. Per-channel median-subtract + std-divide normalisation.
-    # ----------
-    m1 = float(np.median(sbar1_corr))
-    m2 = float(np.median(sbar2_corr))
-    std1 = float(np.std(sbar1_corr))
-    std2 = float(np.std(sbar2_corr))
-    std1 = std1 if std1 > 1e-10 else 1.0
-    std2 = std2 if std2 > 1e-10 else 1.0
-    sbar1_norm = (sbar1_corr - m1) / std1
-    sbar2_norm = (sbar2_corr - m2) / std2
-
-    # 5. Non-negative OLS slope on the normalised 1-D traces.
-    # ----------
-    _mn1 = float(np.mean(sbar1_norm))
-    _mn2 = float(np.mean(sbar2_norm))
-    _var1 = max(float(np.var(sbar1_norm)), 1e-10)
-    _cov12 = float(np.mean(sbar1_norm * sbar2_norm) - _mn1 * _mn2)
-    _beta1_norm_pre = _cov12 / _var1
-    if nn_slope and _beta1_norm_pre < 0:
-        beta1_norm = 0.0
-    else:
-        beta1_norm = _beta1_norm_pre
-
-    if verbose:
-        print(f'\t\t\tβ₁ (normalised) = {beta1_norm:.6g} '
-              f'(raw fit {_beta1_norm_pre:.6g}, '
-              f'nn={"on" if nn_slope else "off"})')
-        print(f'\t\t\tσ̄1 = {std1:.4g}, σ̄2 = {std2:.4g}, '
-              f'm̄1 = {m1:.4g}, m̄2 = {m2:.4g}')
-
-    # ------------------------------------------------------------------
-    # Phase B — per-voxel zdFF, computed exactly as in the Martianova
-    # reference implementation:
-    #
-    #     s1_norm(t, x, y) = (s1(t, x, y) − b1(t) − m1_xy) / σ1_xy
-    #     s2_norm(t, x, y) = (s2(t, x, y) − b2(t) − m2_xy) / σ2_xy
-    #     zdFF(t, x, y)    = s2_norm(t, x, y)  −  β · s1_norm(t, x, y)
-    #
-    # That is: subtract a β-scaled normalised control trace from a
-    # normalised signal trace. No division by F̂ — the previous
-    # "(s2 − F̂)/F̂ then z-score" form (also no longer in the paper)
-    # had a destructive failure mode when β cleanly explained s2:
-    # numerator → 0 across all time points, producing a uniformly
-    # flat red_corr even at frames where red diverges visibly from
-    # green. The subtraction form preserves any feature unique to s2
-    # at its full normalised magnitude (≈ z-score units of s2), with
-    # shared features attenuated by (1 − β).
-    # ------------------------------------------------------------------
-
-    # Session means of the airPLS baselines (scalars).
-    # ----------
-    mean_b1 = np.float32(np.mean(b1))
-    mean_b2 = np.float32(np.mean(b2))
-
-    # Per-pixel "median" surrogate: pix_mean − mean(b). Mean ≈ median
-    # for post-baseline-removed distributions, and we already have it
-    # cheaply from pass 1. m_xy is the session-mean of (s − b) per
-    # pixel — used as the per-pixel centring constant.
-    # ----------
-    m1_xy = (pix_mean_s1 - float(mean_b1)).astype(np.float32)
-    m2_xy = (pix_mean_s2 - float(mean_b2)).astype(np.float32)
-
-    # Per-pixel std of the raw signal. From pass-1 second moments.
-    # Strictly we want std of (s − b), not std of s, but a slow
-    # airPLS baseline contributes negligible variance relative to the
-    # per-pixel biological + shot noise, so Var(s − b)_xy ≈ Var(s)_xy.
-    # ----------
-    std1_xy = np.sqrt(pix_var_s1).astype(np.float32)
-    std2_xy = np.sqrt(pix_var_s2).astype(np.float32)
-    # Robust floor: dark / dead pixels with σ ≪ median would amplify
-    # noise wildly in the normalisation. Bump up to max(1% of median,
-    # eps). Real pixels are unaffected.
-    _sd1_med = float(np.median(std1_xy))
-    _sd2_med = float(np.median(std2_xy))
-    _sd1_floor = np.float32(max(_sd1_med * 0.01, eps))
-    _sd2_floor = np.float32(max(_sd2_med * 0.01, eps))
-    std1_xy = np.maximum(std1_xy, _sd1_floor)
-    std2_xy = np.maximum(std2_xy, _sd2_floor)
-    # Reciprocals: turn the per-voxel divide into a multiply in the
-    # tight loop (cheaper, lets numpy fuse with the broadcasting).
-    inv_std1 = (np.float32(1.0) / std1_xy).astype(np.float32)
-    inv_std2 = (np.float32(1.0) / std2_xy).astype(np.float32)
-
-    # β-coupling between the two channels. Two modes:
-    #
-    #   fit_mode='global' (default, paper-faithful):
-    #       One scalar β = β_norm fit by OLS on the spatial-mean
-    #       normalised traces s̄1_norm(t), s̄2_norm(t). Applied uniformly
-    #       to every pixel. Matches the Martianova 1-D photometry
-    #       reference exactly. For 2-photon data where the true
-    #       coupling varies spatially, this can over-subtract at low-
-    #       coupling pixels (spatial Pearson(red_corr, grn) goes
-    #       strongly negative — sectors with weak local coupling lose
-    #       more red than they should).
-    #
-    #   fit_mode='per_pixel':
-    #       Per-pixel β_xy = pix_cov / (σ1_xy · σ2_xy) — exactly the
-    #       per-pixel Pearson r between s1 and s2 (which equals the
-    #       per-pixel OLS slope of s2_norm on s1_norm in normalised
-    #       space). High-coupling pixels get strong subtraction; low-
-    #       coupling pixels get little. Adapts the correction to local
-    #       coupling. Recommended for spatial 2-photon data where the
-    #       single-global-β assumption breaks down.
-    # ----------
-    if fit_mode == 'per_pixel':
-        # Per-pixel Pearson r. Uses raw (pre-floor) σ so β reflects the
-        # actual coupling at dark pixels rather than the floored value.
-        _raw_sd1 = np.sqrt(pix_var_s1).astype(np.float32)
-        _raw_sd2 = np.sqrt(pix_var_s2).astype(np.float32)
-        _denom_R = np.maximum(_raw_sd1 * _raw_sd2, np.float32(eps))
-        beta1 = (pix_cov_s1s2 / _denom_R).astype(np.float32)
-        if nn_slope:
-            # The paper's non-negative constraint: clamp negative
-            # per-pixel R to 0 so the control can only *add*, never
-            # *subtract* from the predicted signal.
-            beta1 = np.maximum(beta1, np.float32(0.0))
-        # Defensive clamp: pixels with near-perfect coupling (R ≈ 1)
-        # are honoured; pixels with anomalous R > 1 (numerical noise on
-        # very-dim pixels) are clipped to 1.
-        beta1 = np.minimum(beta1, np.float32(1.0))
-        coefficients[:, :, 0] = m2_xy
-        coefficients[:, :, 1] = beta1
-        del _raw_sd1, _raw_sd2, _denom_R
-    elif fit_mode == 'global':
-        beta1 = np.float32(beta1_norm)
-        coefficients[:, :, 0] = m2_xy
-        coefficients[:, :, 1] = float(beta1)
-    else:
-        raise ValueError(
-            f"fit_mode must be 'global' or 'per_pixel', got "
-            f"{fit_mode!r}")
-    del pix_var_s1, pix_var_s2, pix_cov_s1s2
-
-    if verbose:
-        if fit_mode == 'per_pixel':
-            _b = np.asarray(beta1)
-            print(f'\t\tfit_mode=per_pixel: β_xy median = '
-                  f'{float(np.median(_b)):.4f}, '
-                  f'range [{float(_b.min()):.4f}, '
-                  f'{float(_b.max()):.4f}], '
-                  f'(global β for reference = {beta1_norm:.4f})')
-        print(f'\t\tper-pixel σ̂1 median = {_sd1_med:.4g} '
-              f'(floor {float(_sd1_floor):.4g})')
-        print(f'\t\tper-pixel σ̂2 median = {_sd2_med:.4g} '
-              f'(floor {float(_sd2_floor):.4g})')
-
-    # Baseline traces as float32 for cheaper broadcasting in pass 2.
-    # ----------
-    b1_f32 = b1.astype(np.float32)
-    b2_f32 = b2.astype(np.float32)
-
-    # ------------------------------------------------------------------
-    # Pass 2 (final) — one streaming read of s1, s2; compute zdFF
-    # per voxel in-place; write to output buffer or aggregate.
-    # ------------------------------------------------------------------
-    if verbose:
-        _what = 'aggregating' if _aggregates else 'writing'
-        print(f'\t\tpass 2/2: {_what} zdFF (Martianova subtraction) '
-              f'({n_batches} time batches)...')
-
-    for bi, t_start, t_end, s1_b, s2_b in _batched_f32(
-            s1, s2, T, batch_size):
-        if verbose:
-            pct = (bi + 1) / n_batches * 100
-            print(f'\t\t\tbatch {bi+1}/{n_batches} ({pct:.1f}%)...',
-                  end='\r')
-        _b1_slice = b1_f32[t_start:t_end][:, None, None]
-        _b2_slice = b2_f32[t_start:t_end][:, None, None]
-        # s1_norm: in-place into s1_b.
-        #   s1_b ← ((s1 − b1) − m1_xy) · (1 / σ1_xy)
-        s1_b -= _b1_slice
-        s1_b -= m1_xy
-        s1_b *= inv_std1
-        # s2_norm: in-place into s2_b.
-        #   s2_b ← ((s2 − b2) − m2_xy) · (1 / σ2_xy)
-        s2_b -= _b2_slice
-        s2_b -= m2_xy
-        s2_b *= inv_std2
-        # zdFF = s2_norm − β·s1_norm, overwriting s2_b. β is scalar
-        # (global mode) or (X, Y) per-pixel (per_pixel mode); numpy
-        # broadcasting handles both cases identically in-place.
-        s1_b *= beta1
-        s2_b -= s1_b
-
-        # Defensive clamp before float16 cast / sector aggregation.
-        # Properly-normalised zdFF lives in ±10; values beyond ±1000
-        # would only appear if the per-pixel σ floor missed a truly
-        # pathological pixel. ±32000 keeps everything inside float16
-        # while preserving real outliers.
-        np.clip(s2_b, -32000.0, 32000.0, out=s2_b)
-
-        if _aggregates:
-            # Whole-frame mean per time (cheap, ~1 ms per batch).
-            agg_frame_f[t_start:t_end] = s2_b.mean(
-                axis=(1, 2), dtype=np.float32)
-            # Per-sector mean — vectorised reshape; mirrors
-            # QCMixin._compute_sectors so the output is bit-compatible
-            # with the existing extractor.
-            _k = s2_b.shape[0]
-            _block = s2_b[:, :_Ly_t, :_Lx_t].reshape(
-                _k, _n_sec, _by, _n_sec, _bx).mean(axis=(2, 4))
-            agg_sector_f[:, t_start:t_end] = _block.reshape(_k, -1).T
-        else:
-            corrected[t_start:t_end] = _clip_to_dtype(s2_b, dtype)
-
-    if verbose:
-        print(f'\t\t\tbatch {n_batches}/{n_batches} (100.0%)...done      ')
-
-    if _aggregates:
-        return ({'frame_f': agg_frame_f,
-                 'sector_f': agg_sector_f,
-                 'n_sectors': _n_sec,
-                 'is_aggregates': True},
-                coefficients)
-
-    if output_path is not None:
-        corrected.flush()
-        if verbose:
-            print('\t\tflushed output to disk')
-
-    return corrected, coefficients
 
 
 def correct_lms_adaptive(
@@ -2336,9 +1235,7 @@ def correct_pca_shared_variance(
         dtype=np.int16,
         verbose=True,
         n_jobs=-1,
-        output_path=None,
-        fit_backend='auto',
-        fit_temporal_stride=4):
+        output_path=None):
     """
     PCA-based correction by removing shared variance components.
 
@@ -2369,32 +1266,6 @@ def correct_pca_shared_variance(
     output_path : str, optional
         If provided, write corrected signal to this path as a memory-mapped
         TIFF file instead of storing in RAM. (default: None)
-    fit_backend : str
-        Backend for the PCA fit step (pass 2). One of:
-        - 'auto'   (default): use 'torch' if pytorch is importable, else
-                   fall back to 'sklearn'.
-        - 'torch': use torch.pca_lowrank (randomised SVD on CPU). ~20-30x
-                   faster than IncrementalPCA at production scale, but
-                   requires the (T_fit, n_total_fit) fit matrix to fit in
-                   RAM. Use fit_temporal_stride > 1 to subsample frames
-                   for the fit if RAM is tight.
-        - 'sklearn': sklearn.IncrementalPCA (streaming; slower but constant
-                   memory).
-    fit_temporal_stride : int
-        Temporal subsampling stride for the fit matrix when using the
-        torch backend. Only every Nth frame contributes to the PCA fit;
-        the basis is then applied to every frame in pass 3.
-
-        The fit matrix size in RAM is roughly
-            (single-channel TIFF bytes) / fit_temporal_stride
-        (input is int16, fit matrix is float32 but uses 1/spatial_subsample
-        of the pixels and stacks both channels). For a ~20 GB single-
-        channel recording on a 16 GB M1 Pro, stride 4 gives a ~5 GB fit
-        matrix — leaves enough headroom for Python, intermediate arrays,
-        and pca_lowrank's internal working set. Drop to 3 if you have
-        more RAM free; raise to 6+ if you see swap.
-
-        Default 4.
 
     Returns
     -------
@@ -2430,24 +1301,6 @@ def correct_pca_shared_variance(
     if n_components == 'auto':
         n_components = min(50, n_total_fit // 10, T)
         n_components = max(n_components, min(5, T))
-
-    # Resolve fit backend
-    _torch = None
-    if fit_backend in ('auto', 'torch'):
-        try:
-            import torch as _torch
-        except ImportError:
-            if fit_backend == 'torch':
-                raise ImportError(
-                    "fit_backend='torch' requires pytorch; install it or "
-                    "pass fit_backend='sklearn'")
-            _torch = None
-    _use_torch = _torch is not None
-    if fit_backend == 'sklearn':
-        _use_torch = False
-    if fit_temporal_stride < 1:
-        raise ValueError(
-            f"fit_temporal_stride must be >= 1, got {fit_temporal_stride}")
 
     # Streaming PCA — never materialise s1[:, fit_pixels] or s2[:, fit_pixels]
     # up front (that would be T × n_fit_pixels × 4 bytes per channel).
@@ -2485,89 +1338,35 @@ def correct_pca_shared_variance(
     del sum_s1, sum_s2
 
     # ------------------------------------------------------------------
-    # Pass 2: fit PCA (torch.pca_lowrank or IncrementalPCA)
+    # Pass 2: fit IncrementalPCA in temporal batches
     # ------------------------------------------------------------------
+    if verbose:
+        print(f'\t\tpass 2/5: fitting PCA ({n_components} components, '
+              f'{n_batches} batches)...')
+    ipca = IncrementalPCA(n_components=n_components)
     combined_buf = np.empty((batch_size, n_fit_pixels * 2), dtype=np.float32)
-    if _use_torch:
-        # Randomised SVD on the centered fit matrix held in RAM. Much
-        # faster than sklearn's IncrementalPCA (~20-30x at production
-        # scale). Optional temporal subsampling keeps RAM in check on
-        # long recordings.
-        T_fit = (T + fit_temporal_stride - 1) // fit_temporal_stride
+    batches_fit = 0
+    for batch_idx in range(n_batches):
+        t0 = batch_idx * batch_size
+        t1 = min(t0 + batch_size, T)
+        bt = t1 - t0
+        if bt < n_components:   # IncrementalPCA requires batch >= n_components
+            break
         if verbose:
-            _ram_gb = T_fit * n_total_fit * 4 / 1e9
-            print(f'\t\tpass 2/5: fitting PCA [torch.pca_lowrank] '
-                  f'({n_components} components, T_fit={T_fit}, '
-                  f'~{_ram_gb:.2f} GB)...')
-        fit_mat = np.empty((T_fit, n_total_fit), dtype=np.float32)
-        write_idx = 0
-        for batch_idx in range(n_batches):
-            t0 = batch_idx * batch_size
-            t1 = min(t0 + batch_size, T)
-            bt = t1 - t0
-            if verbose:
-                pct = (batch_idx + 1) / n_batches * 100
-                print(f'\t\t\tbatch {batch_idx+1}/{n_batches} '
-                      f'({pct:.1f}%)...', end='\r')
-            s1_b = np.asarray(s1[t0:t1], dtype=np.float32).reshape(bt, -1)
-            s2_b = np.asarray(s2[t0:t1], dtype=np.float32).reshape(bt, -1)
-            combined_buf[:bt, :n_fit_pixels] = (
-                s1_b[:, fit_pixel_indices] - s1_mean)
-            combined_buf[:bt, n_fit_pixels:] = (
-                s2_b[:, fit_pixel_indices] - s2_mean)
-            # Select strided frames within this batch that map to fit rows
-            _local = np.arange(bt)
-            _global = t0 + _local
-            _sel = _local[_global % fit_temporal_stride == 0]
-            if _sel.size == 0:
-                continue
-            _n_sel = _sel.size
-            fit_mat[write_idx:write_idx + _n_sel] = combined_buf[_sel]
-            write_idx += _n_sel
-        fit_mat = fit_mat[:write_idx]
-        if verbose:
-            print(f'\t\t\tbatch {n_batches}/{n_batches} (100.0%)...done    ')
-            print(f'\t\t\trunning torch.pca_lowrank '
-                  f'(q={n_components + 10}, niter=4)...')
-        # Data is already mean-centered, so disable internal centering.
-        _q = min(n_components + 10, min(fit_mat.shape))
-        _A = _torch.from_numpy(fit_mat)
-        _U, _S, _V = _torch.pca_lowrank(
-            _A, q=_q, center=False, niter=4)
-        components = _V[:, :n_components].T.contiguous().numpy()
-        _S2 = (_S ** 2).numpy().astype(np.float64)
-        explained_variance = (_S2[:n_components] / _S2.sum()).astype(
-            np.float32)
-        del fit_mat, _A, _U, _S, _V, _S2
-    else:
-        if verbose:
-            print(f'\t\tpass 2/5: fitting PCA [IncrementalPCA] '
-                  f'({n_components} components, {n_batches} batches)...')
-        ipca = IncrementalPCA(n_components=n_components)
-        batches_fit = 0
-        for batch_idx in range(n_batches):
-            t0 = batch_idx * batch_size
-            t1 = min(t0 + batch_size, T)
-            bt = t1 - t0
-            if bt < n_components:
-                break
-            if verbose:
-                pct = (batch_idx + 1) / n_batches * 100
-                print(f'\t\t\tbatch {batch_idx+1}/{n_batches} '
-                      f'({pct:.1f}%)...', end='\r')
-            s1_b = np.asarray(s1[t0:t1], dtype=np.float32).reshape(bt, -1)
-            s2_b = np.asarray(s2[t0:t1], dtype=np.float32).reshape(bt, -1)
-            combined_buf[:bt, :n_fit_pixels] = (
-                s1_b[:, fit_pixel_indices] - s1_mean)
-            combined_buf[:bt, n_fit_pixels:] = (
-                s2_b[:, fit_pixel_indices] - s2_mean)
-            ipca.partial_fit(combined_buf[:bt])
-            batches_fit += 1
-        if verbose:
-            print(f'\t\t\t{batches_fit}/{n_batches} batches fitted '
-                  f'(100.0%)...done')
-        components = ipca.components_
-        explained_variance = ipca.explained_variance_ratio_
+            pct = (batch_idx + 1) / n_batches * 100
+            print(f'\t\t\tbatch {batch_idx+1}/{n_batches} ({pct:.1f}%)...',
+                  end='\r')
+        s1_b = np.asarray(s1[t0:t1], dtype=np.float32).reshape(bt, -1)
+        s2_b = np.asarray(s2[t0:t1], dtype=np.float32).reshape(bt, -1)
+        combined_buf[:bt, :n_fit_pixels] = s1_b[:, fit_pixel_indices] - s1_mean
+        combined_buf[:bt, n_fit_pixels:] = s2_b[:, fit_pixel_indices] - s2_mean
+        ipca.partial_fit(combined_buf[:bt])
+        batches_fit += 1
+    if verbose:
+        print(f'\t\t\t{batches_fit}/{n_batches} batches fitted (100.0%)...done')
+
+    components = ipca.components_
+    explained_variance = ipca.explained_variance_ratio_
 
     # Identify noise components
     s1_loadings = _compute_s1_loadings(components, n_fit_pixels)

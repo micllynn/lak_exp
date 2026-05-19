@@ -15,6 +15,7 @@ import numpy as np
 import scipy as sp
 import scipy.stats as sp_stats
 import seaborn as sns
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gs
 
@@ -31,8 +32,53 @@ class PlotsMixin:
     """Plotting methods mixed into TwoPRec."""
 
     # ------------------------------------
-    # Shared helper
+    # Shared helpers
     # ------------------------------------
+
+    @staticmethod
+    def _channel_palette(channel, n_colors=3, as_cmap=False):
+        """Return a colour palette matched to the imaging channel.
+
+        Parameters
+        ----------
+        channel : str or None
+            'red', 'grn', or None (default neutral palette).
+        n_colors : int
+            Number of discrete colours (ignored when as_cmap=True).
+        as_cmap : bool
+            If True return a continuous matplotlib Colormap.
+        """
+        if as_cmap:
+            if channel == 'red':
+                return sns.light_palette('firebrick', as_cmap=True)
+            elif channel == 'grn':
+                return sns.light_palette('forestgreen', as_cmap=True)
+            else:
+                return sns.cubehelix_palette(
+                    as_cmap=True, start=2, rot=0,
+                    dark=0.1, light=0.6)
+        # Discrete traces: high-contrast colors visible against any background.
+        # White, gold, deepskyblue have large RGB euclidean distance and stand
+        # out against both red and green fluorescence backgrounds.
+        _contrast = ['#ffffff', '#ffd700', '#00e5ff']
+        return _contrast[:n_colors]
+
+    @staticmethod
+    def _channel_img_cmap(channel):
+        """Return an imshow colormap for the imaging channel.
+
+        Parameters
+        ----------
+        channel : str or None
+            'red', 'grn', or None (default 'gray').
+        """
+        if channel == 'red':
+            return mpl.colors.LinearSegmentedColormap.from_list(
+                'red_flu', ['#080000', '#ff2020'])
+        elif channel == 'grn':
+            return mpl.colors.LinearSegmentedColormap.from_list(
+                'grn_flu', ['#000800', '#20ff20'])
+        return 'gray'
 
     def _finish_plot(self, fig, ax, xlabel, ylabel,
                      savepath=None, show=True):
@@ -55,7 +101,8 @@ class PlotsMixin:
                   plot_type=None,
                   plt_show=True,
                   channel=None,
-                  use_zscore=False):
+                  use_zscore=False,
+                  ax=None):
         """
         Plots the average fluorescence across the whole fov,
         separated by trial-type.
@@ -70,18 +117,20 @@ class PlotsMixin:
             Passed to add_frame() / _get_rec(). Ignored in the base class.
         use_zscore : bool
             Passed to add_frame(). If True, use z-score instead of df/f.
+        ax : matplotlib.axes.Axes or None
+            If provided, draw into this axes instead of creating a new
+            figure. When ax is given, figure creation, saving, and
+            show/close are skipped.
         """
         if colors is None:
-            colors = sns.cubehelix_palette(
-                n_colors=3, start=2, rot=0, dark=0.1, light=0.6)
+            colors = self._channel_palette(channel, n_colors=3)
 
         self.add_frame(t_pre=t_pre, t_post=t_post,
                        channel=channel, use_zscore=use_zscore)
 
         # build color and linestyle maps
         if hasattr(self.beh, 'tr_conds_outcome'):
-            _cmap = sns.cubehelix_palette(
-                as_cmap=True, start=2, rot=0, dark=0.1, light=0.6)
+            _cmap = self._channel_palette(channel, as_cmap=True)
             _outcomes = np.asarray(self.beh.tr_conds_outcome, dtype=float)
             _order = np.argsort(_outcomes, kind='mergesort')
             _tile = np.linspace(0.0, 1.0, len(_order)) \
@@ -91,20 +140,24 @@ class PlotsMixin:
                 _tr_cond = str(self.beh._stimparser.parsed_param[_idx])
                 colors[_tr_cond] = _cmap(_tile[_rank])
         else:
-            _palette = sns.cubehelix_palette(
-                n_colors=len(self.beh.tr_inds), start=2, rot=0,
-                dark=0.1, light=0.6)
-            colors = {k: _palette[i] for i, k in enumerate(self.beh.tr_inds)}
+            _palette = self._channel_palette(
+                channel, n_colors=len(self.beh.tr_inds))
+            colors = {k: _palette[i]
+                      for i, k in enumerate(self.beh.tr_inds)}
         linestyles = {k: 'solid' for k in self.beh.tr_inds}
         if '0.5_norew' in linestyles:
             linestyles['0.5_norew'] = 'dashed'
         if '0.5_noprelick' in linestyles:
             linestyles['0.5_noprelick'] = 'dashed'
 
-        fig_avg = plt.figure(figsize=figsize)
-        spec = gs.GridSpec(nrows=1, ncols=1,
-                           figure=fig_avg)
-        ax_trace = fig_avg.add_subplot(spec[0, 0])
+        _external_ax = ax is not None
+        if _external_ax:
+            ax_trace = ax
+            fig_avg = None
+        else:
+            fig_avg = plt.figure(figsize=figsize)
+            spec = gs.GridSpec(nrows=1, ncols=1, figure=fig_avg)
+            ax_trace = fig_avg.add_subplot(spec[0, 0])
 
         # determine which conditions to plot
         if plot_type is None:
@@ -145,24 +198,25 @@ class PlotsMixin:
         ax_trace.set_ylabel('z-score (frame)' if use_zscore
                             else 'df/f (frame)')
 
-        _ch_suffix = f'ch={channel}' if channel is not None else \
-            (f'ch={self.ch_img}' if hasattr(self, 'ch_img') else '')
-        corr_suffix = ''
-        if channel == 'grn' and hasattr(self, 'rec_t_grn') \
-           and hasattr(self, 'corr_sig_method'):
-            corr_suffix = f'_corr={self.corr_sig_method}'
-        zscore_suffix = '_zscore' if use_zscore else ''
-        fig_avg.savefig(os.path.join(
-            str(self.folder.figs),
-            f'{self.path.animal}_{self.path.date}_{self.path.beh_folder}_'
-            + f'{plot_type=}_{t_pre=}_{t_post=}_'
-            + f'{_ch_suffix}{corr_suffix}'
-            + f'{zscore_suffix}_mean_trial_activity.pdf'))
+        if not _external_ax:
+            _ch_suffix = f'ch={channel}' if channel is not None else \
+                (f'ch={self.ch_img}' if hasattr(self, 'ch_img') else '')
+            corr_suffix = ''
+            if channel == 'grn' and hasattr(self, 'rec_t_grn') \
+               and hasattr(self, 'corr_sig_method'):
+                corr_suffix = f'_corr={self.corr_sig_method}'
+            zscore_suffix = '_zscore' if use_zscore else ''
+            fig_avg.savefig(os.path.join(
+                str(self.folder.figs),
+                f'{self.path.animal}_{self.path.date}_{self.path.beh_folder}_'
+                + f'{plot_type=}_{t_pre=}_{t_post=}_'
+                + f'{_ch_suffix}{corr_suffix}'
+                + f'{zscore_suffix}_mean_trial_activity.pdf'))
 
-        if plt_show:
-            plt.show()
-        else:
-            plt.close(fig_avg)
+            if plt_show:
+                plt.show()
+            else:
+                plt.close(fig_avg)
 
     def plt_sectors(self,
                     n_sectors=10,
@@ -185,18 +239,31 @@ class PlotsMixin:
                     use_zscore=False,
                     outlier_thresh=None,
                     auto_gain_dff=False,
+                    auto_gain_dff_scale=0.7,
                     minimal_output=False,
-                    colors=None):
+                    colors=None,
+                    ax=None):
         """
         Divides the field of view into sectors, and plots a set of trial-types
         separately within each sector.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes or None
+            If provided, draw the main sector overlay into this axes
+            instead of creating a new figure. When ax is given, figure
+            creation, saving, supplemental plots, and show/close are
+            all skipped (minimal_output is forced True).
         """
+        _external_ax = ax is not None
+        if _external_ax:
+            minimal_output = True
+
         if plt_dff is None:
             plt_dff = {'x': {'gain': 0.6, 'offset': 0.2},
                        'y': {'gain': 10, 'offset': 0.2}}
         if colors is None:
-            colors = sns.cubehelix_palette(
-                n_colors=3, start=2, rot=0, dark=0.2, light=0.8)
+            colors = self._channel_palette(channel, n_colors=3)
 
         rec = self._get_rec(channel)
         rec_t = self._get_rec_t(channel)
@@ -221,13 +288,19 @@ class PlotsMixin:
             outlier_thresh = 20 if _use_zscore else 1
 
         # ---- stim_list from plot_type ----
-        _stim_list_map = {
-            None: ['0', '0.5', '1'],
-            'rew_norew': ['0.5_rew', '0.5_norew'],
-            'prelick_noprelick': ['0.5_prelick', '0.5_noprelick'],
-            'rew': ['0', '0.5_rew', '1'],
-        }
-        stim_list = _stim_list_map.get(plot_type, list(self.beh.tr_conds))
+        _is_visual_pavlov = (
+            getattr(self, 'beh_type', None) == 'visual_pavlov')
+        if _is_visual_pavlov:
+            _stim_list_map = {
+                None: ['0', '0.5', '1'],
+                'rew_norew': ['0.5_rew', '0.5_norew'],
+                'prelick_noprelick': ['0.5_prelick', '0.5_noprelick'],
+                'rew': ['0', '0.5_rew', '1'],
+            }
+            stim_list = _stim_list_map.get(
+                plot_type, list(self.beh.tr_conds))
+        else:
+            stim_list = list(self.beh.tr_conds)
 
         # ---- ensure sector data ----
         _sector_cache_valid = (
@@ -263,20 +336,32 @@ class PlotsMixin:
                                 _dff_arr - self.frame.dff[_tr_cond])
             self.sector.params.resid_type = resid_type
 
+        # ---- resolve resid_tr_cond to an existing key ----
+        _available_conds = list(self.sector.dff_resid[0, 0].keys())
+        if resid_tr_cond not in self.sector.dff_resid[0, 0]:
+            resid_tr_cond = _available_conds[0] if _available_conds else None
+
         # ---- colors/linestyle ----
-        self.sector.colors = {'0': colors[0], '0.5': colors[1], '1': colors[2],
-                              '0.5_rew': colors[1], '0.5_norew': colors[1],
-                              '0.5_prelick': colors[1],
-                              '0.5_noprelick': colors[1]}
-        self.sector.linestyle = {'0': 'solid', '0.5': 'solid', '1': 'solid',
-                                 '0.5_rew': 'solid', '0.5_norew': 'dashed',
-                                 '0.5_prelick': 'solid',
-                                 '0.5_noprelick': 'dashed'}
+        if _is_visual_pavlov:
+            self.sector.colors = {
+                '0': colors[0], '0.5': colors[1], '1': colors[2],
+                '0.5_rew': colors[1], '0.5_norew': colors[1],
+                '0.5_prelick': colors[1],
+                '0.5_noprelick': colors[1]}
+            self.sector.linestyle = {
+                '0': 'solid', '0.5': 'solid', '1': 'solid',
+                '0.5_rew': 'solid', '0.5_norew': 'dashed',
+                '0.5_prelick': 'solid',
+                '0.5_noprelick': 'dashed'}
 
         # ---- figure creation ----
-        fig_avg = plt.figure(figsize=figsize)
-        spec_avg = gs.GridSpec(nrows=1, ncols=1, figure=fig_avg)
-        ax_img = fig_avg.add_subplot(spec_avg[0, 0])
+        if _external_ax:
+            ax_img = ax
+            fig_avg = None
+        else:
+            fig_avg = plt.figure(figsize=figsize)
+            spec_avg = gs.GridSpec(nrows=1, ncols=1, figure=fig_avg)
+            ax_img = fig_avg.add_subplot(spec_avg[0, 0])
 
         fig_resid, ax_img_resid = None, None
         if not minimal_output:
@@ -292,9 +377,12 @@ class PlotsMixin:
         _rec_max[:, ::_step] = 0
         _rec_max[::_step, :] = 0
         _extent = [0, n_sectors, n_sectors, 0]
-        ax_img.imshow(_rec_max, extent=_extent, alpha=img_alpha)
+        _img_cmap = self._channel_img_cmap(channel)
+        ax_img.imshow(_rec_max, extent=_extent, alpha=img_alpha,
+                      cmap=_img_cmap)
         if not minimal_output:
-            ax_img_resid.imshow(_rec_max, extent=_extent, alpha=img_alpha)
+            ax_img_resid.imshow(_rec_max, extent=_extent, alpha=img_alpha,
+                                cmap=_img_cmap)
 
         # ---- auto-gain ----
         if auto_gain_dff:
@@ -308,7 +396,8 @@ class PlotsMixin:
             if _max_pos > 0:
                 plt_dff = {**plt_dff,
                            'y': {**plt_dff['y'],
-                                 'gain': (1.0 - plt_dff['y']['offset'])
+                                 'gain': auto_gain_dff_scale
+                                         * (1.0 - plt_dff['y']['offset'])
                                          / _max_pos}}
 
         # ---- plot all sectors ----
@@ -321,6 +410,8 @@ class PlotsMixin:
                 _vkw = dict(linewidth=1, linestyle='dashed')
 
                 for stim_cond in stim_list:
+                    if stim_cond not in self.sector.dff[n_x, n_y]:
+                        continue
                     _dff_mean = np.median(
                         self.sector.dff[n_x, n_y][stim_cond], axis=0)
                     if np.max(np.abs(_dff_mean)) < outlier_thresh:
@@ -330,7 +421,8 @@ class PlotsMixin:
                                     color=self.sector.colors[stim_cond],
                                     linestyle=self.sector.linestyle[stim_cond])
 
-                if not minimal_output:
+                if not minimal_output \
+                   and resid_tr_cond in self.sector.dff_resid[n_x, n_y]:
                     _resid_arr = self.sector.dff_resid[n_x, n_y][resid_tr_cond]
                     _n_tr_resid = _resid_arr.shape[0]
                     _rocket = sns.color_palette('rocket', _n_tr_resid)
@@ -366,31 +458,39 @@ class PlotsMixin:
                                       [_dff_zero, _dff_zero],
                                       color='k', **_vkw)
 
-        # ---- build filename base strings ----
-        corr_suffix = (f'_corr={self.corr_sig_method}'
-                       if channel == 'grn' and hasattr(self, 'rec_t_grn')
-                       and hasattr(self, 'corr_sig_method') else '')
-        zscore_suffix = f'_zscore={_use_zscore}'
-        _figs_dir = str(self.folder.figs)
-        _id = (f'{self.path.animal}_{self.path.date}_{self.path.beh_folder}'
-               f'_{plt_prefix}_{n_sectors=}_{plot_type=}_{t_pre=}_{t_post=}'
-               f'_ch={channel}{corr_suffix}{zscore_suffix}')
-        _id_resid = f'{_id}_{resid_tr_cond=}_{resid_type=}'
+        # ---- build filename base strings and save ----
+        if not _external_ax:
+            corr_suffix = (f'_corr={self.corr_sig_method}'
+                           if channel == 'grn'
+                           and hasattr(self, 'rec_t_grn')
+                           and hasattr(self, 'corr_sig_method') else '')
+            zscore_suffix = f'_zscore={_use_zscore}'
+            _figs_dir = str(self.folder.figs)
+            _id = (f'{self.path.animal}_{self.path.date}'
+                   f'_{self.path.beh_folder}'
+                   f'_{plt_prefix}_{n_sectors=}_{plot_type=}'
+                   f'_{t_pre=}_{t_post=}'
+                   f'_ch={channel}{corr_suffix}{zscore_suffix}')
+            _id_resid = f'{_id}_{resid_tr_cond=}_{resid_type=}'
 
-        fig_avg.savefig(os.path.join(_figs_dir, f'sectors_{_id}.pdf'))
+            fig_avg.savefig(
+                os.path.join(_figs_dir, f'sectors_{_id}.pdf'))
 
         # ---- supplemental plots ----
         if not minimal_output:
-            n_trs = self.sector.dff_resid[0, 0][resid_tr_cond].shape[0]
-            n_rows = int(np.ceil(np.sqrt(n_trs)))
-
-            # normalized sector signals
-            fig_norm_sec_sig = plt.figure(figsize=(3.43, 1.5))
-            spec_norm_sec_sig = gs.GridSpec(nrows=1, ncols=3,
-                                            figure=fig_norm_sec_sig)
-            axes_norm = [fig_norm_sec_sig.add_subplot(spec_norm_sec_sig[0, i])
-                         for i in range(3)]
-            for tr_type, ax_n in zip(['0', '0.5', '1'], axes_norm):
+            # normalized sector signals — one subplot per actual condition
+            _norm_conds = [c for c in stim_list
+                           if c in self.sector.dff[0, 0]]
+            _n_norm = len(_norm_conds)
+            fig_norm_sec_sig = plt.figure(
+                figsize=(3.43 * max(_n_norm, 1), 1.5))
+            spec_norm_sec_sig = gs.GridSpec(
+                nrows=1, ncols=max(_n_norm, 1),
+                figure=fig_norm_sec_sig)
+            for _col, tr_type in enumerate(_norm_conds):
+                ax_n = fig_norm_sec_sig.add_subplot(
+                    spec_norm_sec_sig[0, _col])
+                ax_n.set_title(tr_type)
                 for sec in range(self.sector.n_sectors):
                     sec_x, sec_y = np.divmod(sec, self.sector.n_sectors)
                     _dff = self.sector.dff[sec_x, sec_y][tr_type]
@@ -400,88 +500,395 @@ class PlotsMixin:
                               np.mean(_dff / _sec_max, axis=0),
                               color=self.sector.colors[tr_type], alpha=0.8)
 
-            # residual cross-correlations (vectorized)
-            _n_sec2 = self.sector.n_sectors ** 2
-            _sigs = np.stack([
-                np.mean(self.sector.dff_resid[
-                    s // n_sectors, s % n_sectors][resid_tr_cond], axis=1)
-                for s in range(_n_sec2)])
-            self.sector.resid_corr_stat = np.corrcoef(_sigs)
-            self.sector.resid_corr_pval = np.full_like(
-                self.sector.resid_corr_stat, np.nan)
+            # residual cross-correlations — only if resid_tr_cond is valid
+            fig_resid_corr = None
+            fig_resid_corr_spatial = None
+            fig_resid_tr_sep = None
+            n_trs = 0
+            n_rows = 1
+            if resid_tr_cond is not None \
+               and resid_tr_cond in self.sector.dff_resid[0, 0]:
+                n_trs = self.sector.dff_resid[0, 0][resid_tr_cond].shape[0]
+                n_rows = int(np.ceil(np.sqrt(n_trs)))
+                _n_sec2 = self.sector.n_sectors ** 2
+                _sigs = np.stack([
+                    np.mean(self.sector.dff_resid[
+                        s // n_sectors, s % n_sectors][resid_tr_cond],
+                        axis=1)
+                    for s in range(_n_sec2)])
+                self.sector.resid_corr_stat = np.corrcoef(_sigs)
+                self.sector.resid_corr_pval = np.full_like(
+                    self.sector.resid_corr_stat, np.nan)
 
-            fig_resid_corr = plt.figure(figsize=figsize)
-            spec_resid_corr = gs.GridSpec(nrows=1, ncols=1,
-                                          figure=fig_resid_corr)
-            ax_resid_corr = fig_resid_corr.add_subplot(spec_resid_corr[0, 0])
-            ax_resid_corr.imshow(self.sector.resid_corr_stat)
+                fig_resid_corr = plt.figure(figsize=figsize)
+                spec_resid_corr = gs.GridSpec(nrows=1, ncols=1,
+                                              figure=fig_resid_corr)
+                ax_resid_corr = fig_resid_corr.add_subplot(
+                    spec_resid_corr[0, 0])
+                ax_resid_corr.imshow(self.sector.resid_corr_stat)
 
-            fig_resid_corr_spatial = plt.figure(figsize=figsize)
-            spec_rcs = gs.GridSpec(n_sectors, n_sectors,
-                                   figure=fig_resid_corr_spatial)
-            for s in range(_n_sec2):
-                sx, sy = divmod(s, n_sectors)
-                ax_s = fig_resid_corr_spatial.add_subplot(spec_rcs[sx, sy])
-                ax_s.imshow(
-                    self.sector.resid_corr_stat[s].reshape(
-                        n_sectors, n_sectors),
-                    vmax=1, vmin=-1, cmap='coolwarm')
-                ax_s.set_xticks([])
-                ax_s.set_yticks([])
-            fig_resid_corr_spatial.suptitle(
-                f'residual corrs (spatial), {resid_tr_cond=},'
-                f' residuals vs mean({resid_type})')
+                fig_resid_corr_spatial = plt.figure(figsize=figsize)
+                spec_rcs = gs.GridSpec(n_sectors, n_sectors,
+                                       figure=fig_resid_corr_spatial)
+                for s in range(_n_sec2):
+                    sx, sy = divmod(s, n_sectors)
+                    ax_s = fig_resid_corr_spatial.add_subplot(
+                        spec_rcs[sx, sy])
+                    ax_s.imshow(
+                        self.sector.resid_corr_stat[s].reshape(
+                            n_sectors, n_sectors),
+                        vmax=1, vmin=-1, cmap='coolwarm')
+                    ax_s.set_xticks([])
+                    ax_s.set_yticks([])
+                fig_resid_corr_spatial.suptitle(
+                    f'residual corrs (spatial), {resid_tr_cond=},'
+                    f' residuals vs mean({resid_type})')
 
-            # per-trial residual distributions
-            fig_resid_tr_sep = plt.figure(figsize=figsize)
-            spec_tr = gs.GridSpec(n_rows, n_rows, figure=fig_resid_tr_sep)
-            ax0 = None
-            for tr in range(n_trs):
-                _sector_dff_resid = [
-                    float(np.mean(self.sector.dff_resid[
-                        s // n_sectors, s % n_sectors][resid_tr_cond][tr, :]))
-                    for s in range(_n_sec2)]
-                _tr_x, _tr_y = divmod(tr, n_rows)
-                _ax_kw = dict(sharex=ax0, sharey=ax0) if ax0 is not None else {}
-                ax_tr = fig_resid_tr_sep.add_subplot(
-                    spec_tr[_tr_x, _tr_y], **_ax_kw)
-                if ax0 is None:
-                    ax0 = ax_tr
-                ax_tr.hist(_sector_dff_resid, bins=resid_trial_nbins,
-                           histtype='step', density=True,
-                           color=sns.xkcd_rgb['dark grey'])
-                ax_tr.axvline(0, color='k', linewidth=1, linestyle='dashed')
-                ax_tr.set_xlabel('dff resid.')
-                ax_tr.set_ylabel('pdf')
-                ax_tr.set_title(f'trial={tr}')
-            fig_resid_tr_sep.suptitle(
-                f'residuals vs mean({resid_type}) corrs (spatial),'
-                f' {resid_tr_cond=}, residuals vs mean({resid_type})')
+                fig_resid_tr_sep = plt.figure(figsize=figsize)
+                spec_tr = gs.GridSpec(n_rows, n_rows,
+                                      figure=fig_resid_tr_sep)
+                ax0 = None
+                for tr in range(n_trs):
+                    _sector_dff_resid = [
+                        float(np.mean(self.sector.dff_resid[
+                            s // n_sectors,
+                            s % n_sectors][resid_tr_cond][tr, :]))
+                        for s in range(_n_sec2)]
+                    _tr_x, _tr_y = divmod(tr, n_rows)
+                    _ax_kw = dict(sharex=ax0, sharey=ax0) \
+                        if ax0 is not None else {}
+                    ax_tr = fig_resid_tr_sep.add_subplot(
+                        spec_tr[_tr_x, _tr_y], **_ax_kw)
+                    if ax0 is None:
+                        ax0 = ax_tr
+                    ax_tr.hist(_sector_dff_resid, bins=resid_trial_nbins,
+                               histtype='step', density=True,
+                               color=sns.xkcd_rgb['dark grey'])
+                    ax_tr.axvline(
+                        0, color='k', linewidth=1, linestyle='dashed')
+                    ax_tr.set_xlabel('dff resid.')
+                    ax_tr.set_ylabel('pdf')
+                    ax_tr.set_title(f'trial={tr}')
+                fig_resid_tr_sep.suptitle(
+                    f'residuals vs mean({resid_type}) corrs (spatial),'
+                    f' {resid_tr_cond=}, residuals vs mean({resid_type})')
 
             fig_norm_sec_sig.savefig(
                 os.path.join(_figs_dir, f'sectors_normed_{_id}.pdf'))
-            fig_resid.savefig(
-                os.path.join(_figs_dir, f'sectors_resid_{_id_resid}.pdf'))
-            fig_resid_corr.savefig(
-                os.path.join(_figs_dir,
-                             f'sectors_resid_corr_{_id_resid}.pdf'))
-            fig_resid_corr_spatial.savefig(
-                os.path.join(_figs_dir,
-                             f'sectors_resid_corr_spatial_{_id_resid}.pdf'))
-            fig_resid_tr_sep.savefig(
-                os.path.join(_figs_dir,
-                             f'sectors_resid_trial_sep_{_id_resid}.pdf'))
+            if fig_resid is not None:
+                fig_resid.savefig(
+                    os.path.join(_figs_dir,
+                                 f'sectors_resid_{_id_resid}.pdf'))
+            if fig_resid_corr is not None:
+                fig_resid_corr.savefig(
+                    os.path.join(_figs_dir,
+                                 f'sectors_resid_corr_{_id_resid}.pdf'))
+            if fig_resid_corr_spatial is not None:
+                fig_resid_corr_spatial.savefig(
+                    os.path.join(
+                        _figs_dir,
+                        f'sectors_resid_corr_spatial_{_id_resid}.pdf'))
+            if fig_resid_tr_sep is not None:
+                fig_resid_tr_sep.savefig(
+                    os.path.join(
+                        _figs_dir,
+                        f'sectors_resid_trial_sep_{_id_resid}.pdf'))
 
         # ---- show/close ----
+        if not _external_ax:
+            if plt_show:
+                plt.show()
+            else:
+                plt.close(fig_avg)
+                if not minimal_output:
+                    for _fig in [fig_norm_sec_sig, fig_resid, fig_resid_corr,
+                                 fig_resid_corr_spatial, fig_resid_tr_sep]:
+                        if _fig is not None:
+                            plt.close(_fig)
+
+        return
+
+    def plt_lr_sides(self,
+                     t_pre=2, t_post=5,
+                     plot_type=None,
+                     figsize=(6, 6),
+                     compare_figsize=(3.43, 2),
+                     img_ds_factor=50,
+                     img_alpha=0.5,
+                     plt_dff=None,
+                     plt_prefix='',
+                     plt_show=True,
+                     channel=None,
+                     use_zscore=False,
+                     outlier_thresh=None,
+                     auto_gain_dff=True,
+                     auto_gain_dff_scale=0.7,
+                     colors=None,
+                     ax=None):
+        """
+        Splits the field of view into top and bottom halves and plots mean
+        fluorescence per half.
+
+        By recording geometry, the bottom half of the image corresponds to
+        the left side of the tissue and the top half to the right side.
+
+        Produces two figures:
+         1. Spatial overlay: max-projection image with the mean top- and
+            bottom-half traces overlaid on their respective halves, per
+            trial condition.
+         2. Half-vs-half comparison: single subplot with both halves plotted
+            for each trial condition (linestyle encodes half, color encodes
+            trial condition).
+
+        Parameters
+        ----------
+        plot_type : str or None
+            None -> ['0', '0.5', '1']; 'rew_norew' -> ['0.5_rew',
+            '0.5_norew']; 'prelick_noprelick' -> ['0.5_prelick',
+            '0.5_noprelick']; 'rew' -> ['0', '0.5_rew', '1']; otherwise
+            falls back to self.beh.tr_conds.
+        ax : matplotlib.axes.Axes or None
+            If provided, draw the spatial overlay into this axes; the
+            comparison figure, saving, and show/close are skipped
+            (mirrors plt_sectors external-ax mode).
+        """
+        _external_ax = ax is not None
+
+        if plt_dff is None:
+            plt_dff = {'x': {'gain': 0.6, 'offset': 0.2},
+                       'y': {'gain': 10, 'offset': 0.2}}
+        if colors is None:
+            colors = self._channel_palette(channel, n_colors=3)
+
+        rec = self._get_rec(channel)
+        rec_t = self._get_rec_t(channel)
+        n_frames_pre, _, n_frames_tot, _ = self._aligned_frame_params(
+            t_pre, t_post)
+
+        # ---- resolve _use_zscore (same probe as plt_sectors) ----
+        _use_zscore = use_zscore
+        if not _use_zscore and \
+           self.beh._stimrange.first < self.beh._stimrange.last:
+            _t0 = self.beh.stim.t_start[self.beh._stimrange.first]
+            _ind0 = np.argmin(np.abs(rec_t - (_t0 - t_pre)))
+            _probe = np.mean(rec[_ind0:_ind0 + n_frames_pre], axis=(1, 2))
+            _f0_probe = float(np.mean(_probe)) if _probe.size > 0 else 1.0
+            if np.abs(_f0_probe) < 1.0:
+                _use_zscore = True
+
+        if _use_zscore and not auto_gain_dff:
+            auto_gain_dff = True
+        if outlier_thresh is None:
+            outlier_thresh = 20 if _use_zscore else 1
+
+        # ---- stim_list from plot_type ----
+        _is_visual_pavlov = (
+            getattr(self, 'beh_type', None) == 'visual_pavlov')
+        if _is_visual_pavlov:
+            _stim_list_map = {
+                None: ['0', '0.5', '1'],
+                'rew_norew': ['0.5_rew', '0.5_norew'],
+                'prelick_noprelick': ['0.5_prelick', '0.5_noprelick'],
+                'rew': ['0', '0.5_rew', '1'],
+            }
+            stim_list = _stim_list_map.get(
+                plot_type, list(self.beh.tr_conds))
+        else:
+            stim_list = list(self.beh.tr_conds)
+
+        # ---- ensure sides data is valid / cached ----
+        _sides_cache_valid = (
+            hasattr(self, 'sides')
+            and hasattr(self.sides, 'dff')
+            and hasattr(self.sides, 'params')
+            and self.sides.params.t_rew_pre == t_pre
+            and self.sides.params.t_rew_post == t_post
+            and self.sides.params.channel == channel
+            and self.sides.params.use_zscore == _use_zscore)
+
+        if not _sides_cache_valid:
+            self.add_lr_sides(t_pre=t_pre, t_post=t_post,
+                              channel=channel, use_zscore=_use_zscore)
+
+        # ---- colors / linestyles per condition ----
+        # `colors` is used for the image overlay (drawn on the dark imaging
+        # background — _channel_palette provides light/contrast colors).
+        # `cmp_colors` is used for the white-bg comparison plot and is
+        # sampled from the channel colormap so traces are visible.
+        _cmap_raw = self._channel_img_cmap(channel)
+        _cmp_cmap = (_cmap_raw if callable(_cmap_raw)
+                     else plt.get_cmap('viridis'))
+        _cmp_levels = np.linspace(0.4, 0.95, max(len(stim_list), 1))
+        cmp_pal = [_cmp_cmap(l) for l in _cmp_levels]
+        if _is_visual_pavlov:
+            cond_colors = {
+                '0': colors[0], '0.5': colors[1], '1': colors[2],
+                '0.5_rew': colors[1], '0.5_norew': colors[1],
+                '0.5_prelick': colors[1], '0.5_noprelick': colors[1]}
+            cond_ls = {
+                '0': 'solid', '0.5': 'solid', '1': 'solid',
+                '0.5_rew': 'solid', '0.5_norew': 'dashed',
+                '0.5_prelick': 'solid', '0.5_noprelick': 'dashed'}
+            _vp_order = {'0': 0, '0.5': 1, '1': 2,
+                         '0.5_rew': 1, '0.5_norew': 1,
+                         '0.5_prelick': 1, '0.5_noprelick': 1}
+            _vp_pal = [_cmap(l) for l in np.linspace(0.4, 0.95, 3)]
+            cmp_colors = {k: _vp_pal[_vp_order.get(k, 1)] for k in stim_list}
+        else:
+            _pal = self._channel_palette(
+                channel, n_colors=max(len(stim_list), 1))
+            cond_colors = {k: _pal[i % len(_pal)]
+                           for i, k in enumerate(stim_list)}
+            cond_ls = {k: 'solid' for k in stim_list}
+            cmp_colors = {k: cmp_pal[i % len(cmp_pal)]
+                          for i, k in enumerate(stim_list)}
+
+        # ============================================================
+        # Figure A — spatial overlay
+        # ============================================================
+        if _external_ax:
+            ax_img = ax
+            fig_avg = None
+        else:
+            fig_avg = plt.figure(figsize=figsize)
+            spec_avg = gs.GridSpec(nrows=1, ncols=1, figure=fig_avg)
+            ax_img = fig_avg.add_subplot(spec_avg[0, 0])
+
+        print('\tcreating max projection image...')
+        _rec_max = np.max(rec[::img_ds_factor, :, :], axis=0)
+        _mid = int(_rec_max.shape[0] / 2)
+        _rec_max[_mid, :] = 0
+        _extent = [0, 1, 2, 0]
+        _img_cmap = self._channel_img_cmap(channel)
+        ax_img.imshow(_rec_max, extent=_extent, alpha=img_alpha,
+                      cmap=_img_cmap, aspect='auto')
+
+        # auto-gain: scale using the largest |dff| across both halves /
+        # conditions so the trace never leaves its half.
+        if auto_gain_dff:
+            _max_abs = max(
+                (float(np.max(np.abs(np.median(
+                    self.sides.dff[half][sc], axis=0))))
+                 for half in ('top', 'bottom')
+                 for sc in stim_list
+                 if sc in self.sides.dff[half]
+                 and self.sides.dff[half][sc].shape[0] > 0),
+                default=0.0)
+            if _max_abs > 0:
+                plt_dff = {**plt_dff,
+                           'y': {**plt_dff['y'],
+                                 'gain': auto_gain_dff_scale * 0.5
+                                         / _max_abs}}
+
+        # map half -> y-row index (0 = top half, 1 = bottom half).
+        # Baseline is centered vertically in each half (n_y + 0.5) so that
+        # positive and negative deflections have equal headroom.
+        _half_row = {'top': 0, 'bottom': 1}
+        _half_label = {'top': 'top (right)', 'bottom': 'bottom (left)'}
+        _half_max_extent = 0.5 - plt_dff['y']['offset']
+
+        for half, n_y in _half_row.items():
+            _t_sector = ((self.sides.t / self.sides.t[-1])
+                         * plt_dff['x']['gain']
+                         + plt_dff['x']['offset'])
+            _dff_zero = n_y + 0.5
+            _vkw = dict(linewidth=1, linestyle='dashed')
+
+            for stim_cond in stim_list:
+                if stim_cond not in self.sides.dff[half]:
+                    continue
+                _arr = self.sides.dff[half][stim_cond]
+                if _arr.shape[0] == 0:
+                    continue
+                _dff_mean = np.median(_arr, axis=0)
+                if np.max(np.abs(_dff_mean)) >= outlier_thresh:
+                    continue
+                _shifted = -_dff_mean * plt_dff['y']['gain'] + _dff_zero
+                _shifted = np.clip(_shifted,
+                                   n_y + 0.5 - _half_max_extent,
+                                   n_y + 0.5 + _half_max_extent)
+                ax_img.plot(_t_sector, _shifted,
+                            color=cond_colors.get(stim_cond, 'grey'),
+                            linestyle=cond_ls.get(stim_cond, 'solid'),
+                            label=f'{stim_cond} {_half_label[half]}'
+                            if n_y == 0 else None)
+
+            _t_stim = plt_dff['x']['offset']
+            _t_rew = ((2 / self.sides.t[-1]) * plt_dff['x']['gain']
+                      + plt_dff['x']['offset'])
+            _vline_lo = n_y + 0.5 - _half_max_extent
+            _vline_hi = n_y + 0.5 + _half_max_extent
+            ax_img.plot([_t_stim, _t_stim], [_vline_lo, _vline_hi],
+                        color=sns.xkcd_rgb['dark grey'], **_vkw)
+            ax_img.plot([_t_rew, _t_rew], [_vline_lo, _vline_hi],
+                        color=sns.xkcd_rgb['bright blue'], **_vkw)
+
+        ax_img.set_xticks([])
+        ax_img.set_yticks([0.5, 1.5])
+        ax_img.set_yticklabels(['top (right)', 'bottom (left)'])
+
+        if _external_ax:
+            return
+
+        # ============================================================
+        # Figure B — half-vs-half comparison (plt_frame-style)
+        # ============================================================
+        fig_cmp = plt.figure(figsize=compare_figsize)
+        spec_cmp = gs.GridSpec(nrows=1, ncols=1, figure=fig_cmp)
+        ax_cmp = fig_cmp.add_subplot(spec_cmp[0, 0])
+
+        _half_ls = {'top': 'solid', 'bottom': 'dashed'}
+        for stim_cond in stim_list:
+            _color = cmp_colors.get(stim_cond, 'black')
+            for half in ('top', 'bottom'):
+                if stim_cond not in self.sides.dff[half]:
+                    continue
+                _arr = self.sides.dff[half][stim_cond]
+                if _arr.shape[0] == 0:
+                    continue
+                _mean = np.mean(_arr, axis=0)
+                _std = np.std(_arr, axis=0)
+                _label = f'{stim_cond} {_half_label[half]}'
+                ax_cmp.plot(self.sides.t, _mean,
+                            color=_color,
+                            linestyle=_half_ls[half],
+                            label=_label)
+                ax_cmp.fill_between(
+                    self.sides.t, _mean - _std, _mean + _std,
+                    facecolor=_color, alpha=0.15)
+
+        ax_cmp.axvline(x=0, color=sns.xkcd_rgb['dark grey'],
+                       linewidth=1.5, alpha=0.8)
+        ax_cmp.axvline(x=2, color=sns.xkcd_rgb['bright blue'],
+                       linewidth=1.5, alpha=0.8)
+        ax_cmp.legend(fontsize=6)
+        ax_cmp.set_xlabel('time (s)')
+        ax_cmp.set_ylabel('z-score (half)' if _use_zscore
+                          else 'df/f (half)')
+
+        # ---- save ----
+        corr_suffix = (f'_corr={self.corr_sig_method}'
+                       if channel == 'grn'
+                       and hasattr(self, 'rec_t_grn')
+                       and hasattr(self, 'corr_sig_method') else '')
+        zscore_suffix = f'_zscore={_use_zscore}'
+        _figs_dir = str(self.folder.figs)
+        _id = (f'{self.path.animal}_{self.path.date}'
+               f'_{self.path.beh_folder}'
+               f'_{plt_prefix}_{plot_type=}'
+               f'_{t_pre=}_{t_post=}'
+               f'_ch={channel}{corr_suffix}{zscore_suffix}')
+
+        fig_avg.savefig(
+            os.path.join(_figs_dir, f'lr_sides_{_id}.pdf'))
+        fig_cmp.savefig(
+            os.path.join(_figs_dir, f'lr_sides_compare_{_id}.pdf'))
+
         if plt_show:
             plt.show()
         else:
             plt.close(fig_avg)
-            if not minimal_output:
-                for _fig in [fig_norm_sec_sig, fig_resid, fig_resid_corr,
-                             fig_resid_corr_spatial, fig_resid_tr_sep]:
-                    if _fig is not None:
-                        plt.close(_fig)
+            plt.close(fig_cmp)
 
         return
 
@@ -1034,14 +1441,15 @@ class PlotsMixin:
         _rec_max[:, ::int(_rec_max.shape[0]/n_sectors)] = 0
         _rec_max[::int(_rec_max.shape[0]/n_sectors), :] = 0
 
+        _img_cmap = self._channel_img_cmap(channel)
         ax_dff.imshow(_rec_max,
                       extent=[0, n_sectors,
                               n_sectors, 0],
-                      alpha=img_alpha)
+                      alpha=img_alpha, cmap=_img_cmap)
         ax_dff_null.imshow(_rec_max,
                            extent=[0, n_sectors,
                                    n_sectors, 0],
-                           alpha=img_alpha)
+                           alpha=img_alpha, cmap=_img_cmap)
 
         for n_x in range(n_sectors):
             for n_y in range(n_sectors):
@@ -1892,10 +2300,11 @@ class PlotsMixin:
 
         dff_lick /= count_dffs
 
+        _lick_color = self._channel_palette(channel, n_colors=1)[0]
         fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(1, 1, 1)
         ax.plot(t_lickaligned, dff_lick,
-                color=sns.xkcd_rgb['grey'], linewidth=0.8)
+                color=_lick_color, linewidth=0.8)
         ax.axvline(x=0, color=sns.xkcd_rgb['black'],
                    linestyle='dashed',
                    linewidth=0.8)
