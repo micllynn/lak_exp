@@ -727,6 +727,7 @@ class QCMixin(object):
                         # no post-stride interpolation).
                         if _cs_range is None or _cs_n_full is None:
                             return _arr
+
                         _a, _b = _cs_range
                         if (_b - _a) == _cs_n_full:
                             return _arr
@@ -3444,6 +3445,10 @@ class QCMixin(object):
             # z-score path even when dff_sig is on (used by the
             # corrected-channel column, which is always z-sorted).
             _dff = dff_sig if dff_override is None else bool(dff_override)
+            # Guard against double dF/F: when qc.dff is on the input
+            # traces are already dF/F0 (%), so the per-trial baseline
+            # normalisation below must be skipped.
+            _dff = _dff and not _dff_mode
             _out = []
             for _ev in np.asarray(_stim_t).ravel():
                 _i = int(np.argmin(np.abs(t - _ev)))
@@ -3480,6 +3485,10 @@ class QCMixin(object):
             # Otherwise expect pre-z-scored sectors. dff_override=False
             # forces the z-score path even when dff_sig is on.
             _dff = dff_sig if dff_override is None else bool(dff_override)
+            # Guard against double dF/F: when qc.dff is on the input
+            # sector traces are already dF/F0 (%), so the per-trial
+            # baseline normalisation below must be skipped.
+            _dff = _dff and not _dff_mode
             _avg = np.full((sec_mat.shape[0], n_win), np.nan,
                            dtype=np.float32)
             if _dff:
@@ -3924,6 +3933,8 @@ class QCMixin(object):
                              fontsize=7, color='k',
                              family='monospace')
 
+            return ax_trace
+
         # Unit suffix for axis / colour-bar labels: dF/F0 (%) when dff
         # is on, or when dff_sig per-trial baseline normalisation is on.
         # ITI z-score otherwise.
@@ -3933,7 +3944,7 @@ class QCMixin(object):
         # Leftmost column: raw red fluorescence (dF/F0 if dff=True,
         # else ITI z-score). Sectors sorted with the same ordering used
         # by the corrected/red-grn column. Spatial map shown.
-        _draw_column(
+        _ax_trace_red = _draw_column(
             col=0,
             trace_z=_wf_red,
             sector_z_avg=sector_avg_r,
@@ -3948,7 +3959,7 @@ class QCMixin(object):
 
         # Second column: raw green fluorescence. Same ordering as red,
         # with its own spatial map (Greens cmap) in the bottom row.
-        _draw_column(
+        _ax_trace_grn = _draw_column(
             col=1,
             trace_z=_wf_grn,
             sector_z_avg=sector_avg_g,
@@ -3960,6 +3971,17 @@ class QCMixin(object):
             trace_color=sns.xkcd_rgb['forest green'],
             draw_spatial=True,
             spatial_cmap='Greens')
+
+        # Red and green whole-frame average traces share one y-axis range
+        # (union of both autoscaled limits) so their dF/F amplitudes are
+        # directly comparable by eye.
+        # ----------
+        _rg_lo = min(_ax_trace_red.get_ylim()[0],
+                     _ax_trace_grn.get_ylim()[0])
+        _rg_hi = max(_ax_trace_red.get_ylim()[1],
+                     _ax_trace_grn.get_ylim()[1])
+        _ax_trace_red.set_ylim(_rg_lo, _rg_hi)
+        _ax_trace_grn.set_ylim(_rg_lo, _rg_hi)
 
         # Third column: red/grn ratio. Spatial map is intentionally
         # omitted (the raw-red column already shows a spatial map of the

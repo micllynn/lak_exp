@@ -2,9 +2,32 @@ import tifffile
 
 import numpy as np
 import matplotlib.pyplot as plt
-import os
+import os, re
 import gc
 import xml.etree.ElementTree as ElementTree
+
+
+def _batch_sort_key(fname):
+    """Numeric sort key for suite2p per-batch reg tiffs.
+
+    Suite2p writes the registered stack as per-batch tiffs named
+    'file000.tif', 'file001.tif', ... os.listdir returns these in
+    arbitrary filesystem order, so they must be sorted by their batch
+    index before concatenation or the compiled stack ends up with its
+    500-frame blocks out of temporal order.
+
+    Parameters
+    ----------
+    fname : str
+        Filename (or path) of a suite2p batch tiff.
+
+    Returns
+    -------
+    idx : int
+        First integer found in the basename, or -1 if none.
+    """
+    _digits = re.findall(r'\d+', os.path.basename(fname))
+    return int(_digits[0]) if _digits else -1
 
 
 def stitch_tiffs_memmap(directory, chan=0,
@@ -36,6 +59,10 @@ def stitch_tiffs_memmap(directory, chan=0,
     for f in file_list_raw:
         if f.startswith('file') and f.endswith('.tif'):
             file_list.append(os.path.join(directory, f))
+
+    # Sort by batch index so the 500-frame registered blocks are
+    # concatenated in temporal order (os.listdir order is arbitrary).
+    file_list = sorted(file_list, key=_batch_sort_key)
 
     output_fname = f'compiled_Ch{chan}.tif'
 
@@ -83,6 +110,10 @@ def stitch_tiffs(directory, chan=0,
     for f in file_list_raw:
         if not f.startswith('.') and f.endswith('.tif'):
             file_list.append(f)
+
+    # Sort by batch index so the 500-frame registered blocks are
+    # concatenated in temporal order (os.listdir order is arbitrary).
+    file_list = sorted(file_list, key=_batch_sort_key)
 
     tiff_concat = tifffile.imread(file_list[0])
 
