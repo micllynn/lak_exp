@@ -28,3 +28,6 @@ build/
 
 # Project instructions
 CLAUDE.md
+
+# Claude Code agent worktrees
+.claude/worktrees/
