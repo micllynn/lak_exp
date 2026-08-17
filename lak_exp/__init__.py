@@ -7,4 +7,6 @@ from .dset_twop import DSetObj_5HTCtx
 # Expose batch_run as a submodule (lak_exp.batch_run is the module, not the
 # function). Convenience re-exports for the dual-colour helpers stay flat.
 from . import batch_run
-from .batch_run import bulk_run_twop_correction, plt_grab_ctrl_dualcolour
+from .batch_run import (bulk_run_twop_correction, plt_grab_ctrl_dualcolour,
+                        plt_summary)
+from .utils_twop import load_pixel_trial_traces

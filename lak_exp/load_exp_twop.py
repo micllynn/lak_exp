@@ -1,4 +1,7 @@
 from types import SimpleNamespace
+import hashlib
+import inspect
+import re
 import numpy as np
 import os
 import pathlib
@@ -6,8 +9,10 @@ import tifffile
 import warnings
 
 from .align_imgbeh import Aligner_ImgBeh
-from .utils import (find_event_onsets_autothresh,
-                    find_event_onsets_plateau)
+from .utils import (find_event_onsets,
+                    find_event_onsets_autothresh,
+                    find_event_onsets_plateau,
+                    fmt_kwarg_val as _fmt_kwarg_val)
 from .utils_twop import XMLParser
 from .beh import BehDataSimpleLoad, StimParserNew
 from .exp_defs import ExpSubtypes
@@ -19,6 +24,98 @@ from .twop_qc import QCMixin
 # Suppress NumPy RuntimeWarnings in this module.
 warnings.filterwarnings(
     "ignore", category=RuntimeWarning, module=r"^numpy(\.|$)")
+
+
+# Longest suffix appended to the `_corr_base` stem built in
+# correct_signal ('_celltraces_trialavg.npy'); the kwarg tag's length
+# budget is computed against it so EVERY file derived from that stem
+# fits inside a filesystem name component.
+_CORR_BASE_MAX_SUFFIX = len('_celltraces_trialavg.npy')
+# POSIX NAME_MAX: a single path component may not exceed 255 bytes
+# (macOS/APFS and ext4 both enforce this; exceeding it raises
+# OSError errno 63, 'File name too long').
+_FNAME_MAX_LEN = 255
+
+
+def _full_regress_kwarg_tag(kwargs, max_len=96):
+    """Build a bounded filename tag recording a correct_full_regress run.
+
+    Reflects the signature of
+    ``signal_correction.correct_full_regress`` so the saved file records
+    the parameterisation used. Only the kwargs that DEVIATE from the
+    function's own defaults are spelled out as ``name-value`` tokens; a
+    7-hex-digit hash of the *full* resolved parameterisation (every
+    non-skipped parameter, default or not) is always appended. So the
+    readable part stays short and says what was special about this run,
+    while the hash still distinguishes any two runs that differ in any
+    parameter at all — including runs made before and after a default
+    changes, which the readable part alone could not tell apart.
+
+    Spelling out every parameter (the previous behaviour) overflowed the
+    255-byte filesystem limit on a name component once the stem, the
+    ``_celltraces_trialavg.npy`` suffix and ~17 parameters were summed —
+    ``OSError: [Errno 63] File name too long``. ``max_len`` caps the
+    returned tag; the readable part is truncated (never the hash) when
+    the overrides alone would exceed it.
+
+    Omitted are only the inputs/arguments that do not affect the saved
+    data:
+    - `s1`, `s2`     : the positional input stacks.
+    - `output_path`  : the file being named (circular).
+    - `verbose`      : console output only.
+    - `aggregates_only` : mutually exclusive with `output_path`, so
+      always None on the disk-writing path.
+
+    Parameters
+    ----------
+    kwargs : dict
+        The keyword arguments forwarded to the correction function.
+        Values absent here fall back to the function's own defaults.
+    max_len : int
+        Hard cap on the length of the returned tag, hash included.
+        Default 96. ``correct_signal`` passes the exact budget left by
+        the recording's filename stem.
+
+    Returns
+    -------
+    tag : str
+        e.g. ``fit_mode-per_pixel_regress_type-irls-3f9a1c2`` — the
+        overrides, then the full-parameterisation hash. Runs taking every
+        default give just the hash (``default-<hash>``).
+    """
+    sig = inspect.signature(signal_correction.correct_full_regress)
+    skip = {'s1', 's2', 'output_path', 'verbose', 'aggregates_only'}
+    parts = []
+    full = []
+    for name, param in sig.parameters.items():
+        if name in skip:
+            continue
+        has_default = param.default is not inspect.Parameter.empty
+        if name in kwargs:
+            val = kwargs[name]
+        elif has_default:
+            val = param.default
+        else:
+            continue
+        token = f'{name}-{_fmt_kwarg_val(val)}'
+        full.append(token)
+        # Compare the *rendered* values rather than the objects: some
+        # kwargs are arrays/dicts whose == is not a bool.
+        if not (has_default
+                and _fmt_kwarg_val(val) == _fmt_kwarg_val(param.default)):
+            parts.append(token)
+
+    digest = hashlib.sha1('_'.join(full).encode()).hexdigest()[:7]
+    tag = '_'.join(parts) if parts else 'default'
+    # Keep tuples/dicts readable rather than mangled: (2,4,8) -> 2-4-8.
+    tag = tag.replace(',', '-')
+    tag = re.sub(r'[^A-Za-z0-9._-]', '', tag)
+    # Truncate the readable part only — the hash is what guarantees two
+    # different parameterisations never collide, so it always survives.
+    keep = max(1, int(max_len) - len(digest) - 1)
+    if len(tag) > keep:
+        tag = tag[:keep].rstrip('_-.')
+    return f'{tag}-{digest}'
 
 
 class TwoPRec(AnalysisMixin, PlotsMixin, QCMixin):
@@ -175,7 +272,7 @@ class TwoPRec(AnalysisMixin, PlotsMixin, QCMixin):
 
         # align behavior and imaging data
         # ----------------------
-        self._init_timestamps(self.rec.shape[0], rec_type)
+        self._init_timestamps(self._n_frames_for_timestamps(), rec_type)
 
         # note the first and last stimulus/rew within recording bounds
         # ---------------
@@ -196,7 +293,8 @@ class TwoPRec(AnalysisMixin, PlotsMixin, QCMixin):
                       dset_obj, dset_ind):
         """Set up self.folder and self.path from explicit paths or a dataset
         object. All sub-paths are resolved to absolute paths relative to the
-        enclosing folder. Creates figs_mbl/ if it does not exist."""
+        enclosing folder. Creates figs_mbl/ and data_mbl/ if they do not
+        exist."""
         self.folder = SimpleNamespace()
         self.path = SimpleNamespace()
         if dset_obj is None:
@@ -218,11 +316,36 @@ class TwoPRec(AnalysisMixin, PlotsMixin, QCMixin):
         self.folder.beh = str(_enc / self.folder.beh)
         self.folder.figs = _enc / 'figs_mbl'
         self.folder.figs.mkdir(exist_ok=True)
+        self.folder.data = _enc / 'data_mbl'
+        self.folder.data.mkdir(exist_ok=True)
 
         self.path.raw = _enc
         self.path.animal = _enc.parts[-2]
         self.path.date = _enc.parts[-1]
         self.path.beh_folder = folder_beh  # keep original relative name
+
+    def _rec_file_prefix(self):
+        """'{animal}_{date}_{beh}_' -- the per-recording filename stem.
+
+        data_mbl/ and figs_mbl/ sit at the DATE level and are therefore
+        shared by every behaviour session of that date. Any file named
+        after the imaging stem alone ('compiled_Ch1...') would collide
+        between sessions, so all such outputs carry this prefix — the
+        same convention the QC figures and .npy summaries already use.
+
+        Returns
+        -------
+        prefix : str
+            Empty string if the path namespace is not populated, so
+            callers degrade to the old unprefixed names rather than
+            raising.
+        """
+        _p = getattr(self, 'path', None)
+        _parts = [getattr(_p, _k, None)
+                  for _k in ('animal', 'date', 'beh_folder')]
+        if _p is None or any(_v is None for _v in _parts):
+            return ''
+        return '_'.join(str(_v) for _v in _parts) + '_'
 
     def _init_ops(self, n_px_remove_sides, rec_type):
         """Initialise self.ops namespace with operational parameters."""
@@ -347,6 +470,27 @@ class TwoPRec(AnalysisMixin, PlotsMixin, QCMixin):
             print('\tcould not load suite2p output:')
             print(f'\t\t{e}')
 
+    def _n_frames_for_timestamps(self):
+        """Return the frame count used to build rec_t.
+
+        Uses the loaded recording (self.rec) if available; otherwise falls
+        back to the number of frames in the suite2p output. The latter case
+        occurs when the tiffs are not loaded for a dual-colour recording
+        (fname_img_red and fname_img_grn both None).
+
+        Returns
+        -------
+        n_frames : int
+            Number of imaging frames.
+        """
+        if getattr(self, 'rec', None) is not None:
+            return self.rec.shape[0]
+        if hasattr(self, 'neur') and getattr(self.neur, 'f', None) is not None:
+            return self.neur.f.shape[1]
+        raise RuntimeError(
+            "Cannot determine frame count: neither imaging data nor "
+            "suite2p output was loaded.")
+
     def _init_timestamps(self, n_frames, rec_type):
         """Create self.rec_t timestamps and store in self.neur.t if available.
 
@@ -359,62 +503,116 @@ class TwoPRec(AnalysisMixin, PlotsMixin, QCMixin):
         """
         print('\tcreating timestamps...')
         if rec_type == 'trig_rew':
-            _t_start = self.beh.rew.t[0]
-            _t_end = (n_frames / self.samp_rate) + _t_start
-            self.rec_t = np.linspace(_t_start, _t_end, num=n_frames)
+            # Anchor the imaging clock on the first physical reward echo
+            # (Timeline DAQ). The reward_echo TTL marks the actual reward
+            # delivery; the Block file's totalRewardTimes sit ~30 ms
+            # earlier on a separate software clock. Fall back to the Block
+            # reward time if the echo channel is unavailable.
+            _t_start = self._first_reward_echo_t()
+            if _t_start is None:
+                _t_start = float(self.beh.rew.t[0])
+                print('\t\treward_echo channel unavailable; anchoring '
+                      'rec_t on Block reward time (~30 ms less accurate)')
+            self.rec_t = _t_start + np.arange(n_frames) / self.samp_rate
         elif rec_type == 'paqio':
             self._aligner = Aligner_ImgBeh()
-            self._aligner.parse_img_rewechoes()
-            self._aligner.parse_beh_rewechoes()
+            self._aligner.parse_img_rewechoes(folder=self.folder.beh)
+            self._aligner.parse_beh_rewechoes(folder=self.folder.beh)
             self._aligner.compute_alignment()
-            _t_start = 0
-            _t_end = n_frames / self.samp_rate
-            self.rec_t = np.linspace(_t_start, _t_end, num=n_frames)
+            self.rec_t = np.arange(n_frames) / self.samp_rate
             self.rec_t = self._aligner.correct_img_data(self.rec_t)
 
         if hasattr(self, 'neur'):
             self.neur.t = self.rec_t
 
+    def _first_reward_echo_t(self):
+        """Return the time of the first physical reward echo, or None.
+
+        The reward_echo TTL on the behavioural Timeline DAQ marks actual
+        reward delivery and is the correct anchor for the imaging clock
+        under rec_type='trig_rew'. Returns None if the reward_echo channel
+        or DAQ data is unavailable so the caller can fall back to the Block
+        reward time.
+
+        Returns
+        -------
+        t_echo : float or None
+            Timeline-clock time (s) of the first reward echo onset.
+        """
+        try:
+            _daq = self.beh._daq_data
+            _inds = find_event_onsets(_daq.sig['reward_echo'], thresh=3)
+            if len(_inds) == 0:
+                return None
+            return float(_daq.t[_inds[0]])
+        except (AttributeError, KeyError):
+            return None
+
     def _init_stim_rew_range(self, trial_end=None):
         """Compute self.beh._stimrange and self.beh._rewrange.
 
         Finds the first and last stimulus/reward indices that fall within
-        the recording window. Optionally clips the last trial to trial_end.
+        the recording window. When the imaging file is shorter than the
+        behavioural session, trials whose window extends past the end of
+        the recording (or before its start) are excluded so that only
+        trials with imaging coverage are kept. Optionally clips the last
+        trial to trial_end.
+
+        An event is considered in range when its onset has at least 2 s of
+        recording before it and 4 s after it (the trial window margins).
+
+        Parameters
+        ----------
+        trial_end : None or int
+            If given, overrides the computed last index for both ranges.
         """
-        # stims
-        self.beh._stimrange = SimpleNamespace()
-        n_stims = self.beh.stim.t_start.shape[0]
+        self.beh._stimrange = self._event_range(self.beh.stim.t_start)
+        self.beh._rewrange = self._event_range(self.beh.rew.t)
 
-        _temp_first = 0
-        _temp_last = n_stims - 1
-        for ind_stim in range(n_stims):
-            if self.beh.stim.t_start[ind_stim] + 4 > self.rec_t[-1]:
-                _temp_last = ind_stim - 1
-            if self.beh.stim.t_start[ind_stim] - 2 < self.rec_t[0]:
-                _temp_first = ind_stim + 1
-
-        self.beh._stimrange.first = _temp_first
-        self.beh._stimrange.last = _temp_last
-
-        # rews
-        self.beh._rewrange = SimpleNamespace()
-        n_rews = self.beh.rew.t.shape[0]
-
-        _temp_first = 0
-        _temp_last = n_rews - 1
-        for ind_rew in range(n_rews):
-            if self.beh.rew.t[ind_rew] + 4 > self.rec_t[-1]:
-                _temp_last = ind_stim - 1
-            if self.beh.rew.t[ind_rew] - 2 < self.rec_t[0]:
-                _temp_first = ind_stim + 1
-
-        self.beh._rewrange.first = _temp_first
-        self.beh._rewrange.last = _temp_last
+        _n_stims = self.beh.stim.t_start.shape[0]
+        _n_kept = self.beh._stimrange.last - self.beh._stimrange.first + 1
+        if _n_kept < _n_stims:
+            print(f'\timaging shorter than behaviour: keeping stims '
+                  f'{self.beh._stimrange.first}-{self.beh._stimrange.last} '
+                  f'({_n_kept}/{_n_stims} trials with imaging coverage)')
 
         # if trial_end is manually specified, replace these attributes
         if trial_end is not None:
             self.beh._stimrange.last = trial_end
             self.beh._rewrange.last = trial_end
+
+    def _event_range(self, t_events, t_pre=2, t_post=4):
+        """Return first/last indices of events covered by the recording.
+
+        Parameters
+        ----------
+        t_events : np.ndarray
+            Event onset times (s), assumed monotonically increasing.
+        t_pre : float
+            Required recording margin before each onset (s).
+        t_post : float
+            Required recording margin after each onset (s).
+
+        Returns
+        -------
+        SimpleNamespace
+            .first and .last indices into t_events bounding the events
+            that fall within the recording. If no event is covered,
+            .first is 0 and .last is -1 (an empty range).
+        """
+        t_events = np.asarray(t_events)
+        _in_range = np.where(
+            (t_events - t_pre >= self.rec_t[0])
+            & (t_events + t_post <= self.rec_t[-1]))[0]
+
+        _range = SimpleNamespace()
+        if len(_in_range) > 0:
+            _range.first = int(_in_range[0])
+            _range.last = int(_in_range[-1])
+        else:
+            _range.first = 0
+            _range.last = -1
+        return _range
 
     # ----------------------
     # internal methods called by user-facing class methods
@@ -653,6 +851,8 @@ class TwoPRec_DualColour(TwoPRec):
                  parse_by=None,
                  subtypes=None,
                  n_px_remove_sides=10,
+                 dX_red=-5.79,
+                 dY_red=-4.30,
                  lick_type='noise',
                  lick_sin_v=5,
                  lick_sin_tol=0.02,
@@ -665,11 +865,35 @@ class TwoPRec_DualColour(TwoPRec):
         This class loads two imaging channels:
         - Red channel (typically Ch1) -> self.rec_red
         - Green channel (typically Ch2) -> self.rec_grn
+
+        Red/green laser-path misalignment correction
+        ---------------------------------------------
+        The red and green laser paths are slightly misaligned, so the
+        red movie is rigidly shifted in x and y to register it onto the
+        green channel. The shift is specified in microns and converted to
+        an integer pixel shift using micronsPerPixel from the imaging
+        BACKUP.xml.
+
+        dX_red : float
+            Red laser-path misalignment in x (column, + right) relative to
+            green, in microns. The red movie is shifted by dX_red / um
+            columns to register it onto green; negative means red sits to
+            the LEFT of green. Default -5.79 (from the single-bead
+            calibration 2026-06-03_z-003).
+        dY_red : float
+            Red laser-path misalignment in y relative to green, in
+            microns, in a y-up convention. Negative means red sits BELOW
+            green. Converted to a row shift via -dY_red / um (the array /
+            imshow place row 0 at the top, so the y axis is inverted
+            relative to the row index). Default -4.30 (from the single-bead
+            calibration 2026-06-03_z-003).
         """
         self.ch_img_red = ch_img_red
         self.ch_img_grn = ch_img_grn
         self._fname_img_red = fname_img_red
         self._fname_img_grn = fname_img_grn
+        self._dX_red = dX_red
+        self._dY_red = dY_red
         self._trial_cond_use_int_cast = False
 
         super().__init__(enclosing_folder=enclosing_folder,
@@ -694,12 +918,42 @@ class TwoPRec_DualColour(TwoPRec):
 
     def _init_recording(self, fname_img=None, dset_obj=None,
                         n_px_remove_sides=10, **kwargs):
-        """Load imaging data for a dual-colour recording."""
-        # get filenames of images for both channels
-        list_img = os.listdir(self.folder.img)
+        """Load imaging data for a dual-colour recording.
+
+        If both fname_img_red and fname_img_grn are None (and no dataset
+        object supplies defaults), the channel tiffs are not loaded: only
+        the suite2p folder in folder_img/suite2p and its summary neural
+        activity are used. In that case self.rec_red, self.rec_grn and
+        self.rec are set to None.
+        """
         fname_img_red = getattr(self, '_fname_img_red', None)
         fname_img_grn = (fname_img if fname_img is not None
                          else getattr(self, '_fname_img_grn', None))
+
+        # The sampling rate is always needed (to build rec_t) and is read
+        # from BACKUP.xml independently of the tiffs.
+        self.samp_rate = self._load_sampling_rate_from_backup_xml()
+
+        # If neither channel filename is given (and no dataset defaults
+        # apply), skip tiff loading entirely and rely on the suite2p folder
+        # for neural activity.
+        if (fname_img_red is None and fname_img_grn is None
+                and dset_obj is None):
+            print('no imaging filenames given; skipping tiff load '
+                  '(suite2p only)')
+            self.fname_img_red = None
+            self.fname_img_grn = None
+            self.fname_img = None
+            self._rec_red_raw = None
+            self._rec_grn_raw = None
+            self._crop_px = n_px_remove_sides
+            self.rec_red = None
+            self.rec_grn = None
+            self.rec = None
+            return
+
+        # get filenames of images for both channels
+        list_img = os.listdir(self.folder.img)
 
         # Red channel
         self.fname_img_red = self._resolve_channel_filename(
@@ -715,7 +969,6 @@ class TwoPRec_DualColour(TwoPRec):
         self.fname_img = self.fname_img_grn
 
         print('loading imaging...')
-        self.samp_rate = self._load_sampling_rate_from_backup_xml()
 
         # Load RED channel (keep raw memmap, crop lazily via _get_rec)
         # Storing the raw memmap avoids creating a non-contiguous view that
@@ -735,6 +988,13 @@ class TwoPRec_DualColour(TwoPRec):
             self._rec_grn_raw = self._rec_grn_raw.reshape(
                 -1, self._rec_grn_raw.shape[-2], self._rec_grn_raw.shape[-1])
 
+        # Correct red/green laser-path misalignment: rigidly shift the
+        # red movie onto the green channel. Replaces both raw arrays with
+        # aligned overlap views (zero-copy), so every downstream consumer
+        # (_get_rec_raw, cropping, correct_signal, QC) sees aligned data.
+        # ----------
+        self._align_red_to_grn_inplace()
+
         # Store crop bounds for lazy application
         self._crop_px = n_px_remove_sides
 
@@ -748,6 +1008,129 @@ class TwoPRec_DualColour(TwoPRec):
 
         # Keep self.rec for backwards compatibility (defaults to green)
         self.rec = self.rec_grn
+
+    def _load_microns_per_pixel_from_backup_xml(self):
+        """Parse microns-per-pixel from BACKUP.xml in the imaging folder.
+
+        Returns
+        -------
+        microns : dict or None
+            {'x': float, 'y': float} microns per pixel, or None if no
+            BACKUP.xml could be parsed.
+        """
+        for _file in os.listdir(self.folder.img):
+            if _file.endswith('BACKUP.xml'):
+                try:
+                    xmlobj = XMLParser(os.path.join(self.folder.img, _file))
+                    return xmlobj.get_microns_per_pixel()
+                except Exception:
+                    print('\tcould not parse micronsPerPixel from '
+                          'BACKUP.xml')
+        return None
+
+    @staticmethod
+    def _red_shift_px(dX_red, dY_red, umperpx_x, umperpx_y):
+        """Integer (row, col) shift describing red's displacement relative
+        to green, in array-index space.
+
+        Column follows x directly (off_col = dX_red / um): dX_red is red's
+        column (x, + right) offset relative to green in microns, so a
+        negative dX_red places red at a smaller column (to the left). Row
+        uses a flipped sign (off_row = -dY_red / um) because the array /
+        imshow place row 0 at the top with the row index increasing
+        downward, so dY_red < 0 (red below green, in a y-up convention)
+        maps to a LARGER red row index.
+
+        Verified against the single-bead dual-colour z-stack calibration
+        (2026-06-03_z-003): the measured red-minus-green bead offset is
+        (row +173.6 px, col -234.0 px) = (+4.30 um down, -5.79 um in x) at
+        0.02475 um/px, which this formula reproduces (residual ~4 px).
+
+        Parameters
+        ----------
+        dX_red, dY_red : float
+            Red-vs-green misalignment in microns. dX_red is the column
+            (x, + right) offset; dY_red is the y-up offset (negative =
+            red below green).
+        umperpx_x, umperpx_y : float
+            Microns per pixel for the x and y axes.
+
+        Returns
+        -------
+        off_row, off_col : int
+            Red's displacement (in pixels) relative to green: a red
+            feature aligned with green index (r, c) is found in the raw
+            red array at (r + off_row, c + off_col).
+        """
+        off_col = int(round(dX_red / umperpx_x))
+        off_row = int(round(-dY_red / umperpx_y))
+        return off_row, off_col
+
+    @staticmethod
+    def _align_red_grn(red_raw, grn_raw, off_row, off_col):
+        """Return aligned (red, grn) views cropped to their common region.
+
+        red is shifted by (off_row, off_col) onto green: the returned
+        red[t, r, c] is taken from red_raw[t, r + off_row, c + off_col],
+        and green is cropped to the same valid output region so both
+        outputs share one shape. Both are pure views (zero copy).
+
+        Parameters
+        ----------
+        red_raw, grn_raw : np.ndarray, shape (T, H, W)
+            Raw red and green stacks (equal H, W).
+        off_row, off_col : int
+            Red displacement relative to green (see _red_shift_px).
+
+        Returns
+        -------
+        red_aligned, grn_aligned : np.ndarray
+            Views of shape (T, H - |off_row|, W - |off_col|).
+        """
+        H, W = red_raw.shape[-2], red_raw.shape[-1]
+        r_lo, r_hi = max(0, -off_row), min(H, H - off_row)
+        c_lo, c_hi = max(0, -off_col), min(W, W - off_col)
+        red_aligned = red_raw[:,
+                              r_lo + off_row:r_hi + off_row,
+                              c_lo + off_col:c_hi + off_col]
+        grn_aligned = grn_raw[:, r_lo:r_hi, c_lo:c_hi]
+        return red_aligned, grn_aligned
+
+    def _align_red_to_grn_inplace(self):
+        """Shift self._rec_red_raw onto self._rec_grn_raw and store both
+        aligned views back. Reads micronsPerPixel from BACKUP.xml to
+        convert self._dX_red / self._dY_red (microns) to a pixel shift.
+
+        No-op (identity) when the shift rounds to zero pixels or when
+        micronsPerPixel is unavailable.
+        """
+        dX_red = getattr(self, '_dX_red', 0.0) or 0.0
+        dY_red = getattr(self, '_dY_red', 0.0) or 0.0
+
+        microns = self._load_microns_per_pixel_from_backup_xml()
+        if microns is None:
+            print('\tskipping red/grn alignment (no micronsPerPixel)')
+            self.red_shift_px = (0, 0)
+            return
+
+        off_row, off_col = self._red_shift_px(
+            dX_red, dY_red, microns['x'], microns['y'])
+        self.red_shift_px = (off_row, off_col)
+        self.ops.dX_red = dX_red
+        self.ops.dY_red = dY_red
+        self.ops.microns_per_pixel = microns
+
+        if off_row == 0 and off_col == 0:
+            print('\tred/grn alignment is 0 px; no shift applied')
+            return
+
+        print(f'\tcorrecting red/grn misalignment: '
+              f'dX={dX_red:.2f}um, dY={dY_red:.2f}um -> '
+              f'shift red by (row={off_row:+d}, col={off_col:+d}) px '
+              f'(um/px x={microns["x"]:.3f}, y={microns["y"]:.3f})')
+
+        self._rec_red_raw, self._rec_grn_raw = self._align_red_grn(
+            self._rec_red_raw, self._rec_grn_raw, off_row, off_col)
 
     def _get_rec_raw(self, channel='grn'):
         """
@@ -787,12 +1170,155 @@ class TwoPRec_DualColour(TwoPRec):
     # and _trial_cond_map.
     # ---------------
 
-    def correct_signal(self, method='linear', save_to_disk=False,
+    def _stim_off_times(self):
+        """Per-trial visual-stimulus offset times (behaviour clock).
+
+        The visual stimulus and its sync square turn off at
+        ``stimulusOffTimes`` (task def: ``stimulusOff =
+        stimulusOn.delay(stimulusDuration)``) — this is where the
+        stimulus light-leak actually ends. Reward time is a *different*
+        event (``rewardOnsetTime``) and coincides with stimulus offset
+        only when ``stimulusDuration == rewardOnsetTime``; keying the
+        step off reward instead silently halves the estimate (the OFF
+        edge measures no jump) and mis-places the subtraction box
+        whenever the two differ. Falls back to ``totalRewardTimes`` for
+        older Blocks that never logged ``stimulusOffTimes``.
+
+        Returns
+        -------
+        off_t : np.ndarray or None
+            Per-trial offset times, or None if neither event is available.
+        source : str or None
+            'stimulusOffTimes' or 'totalRewardTimes' — which was used.
+        """
+        if not hasattr(self, 'beh') or not hasattr(self.beh, '_data'):
+            return None, None
+        for _var in ('stimulusOffTimes', 'totalRewardTimes'):
+            try:
+                _v = np.asarray(self.beh._data.get_event_var(_var),
+                                dtype=float).ravel()
+            except (AttributeError, KeyError, TypeError):
+                continue
+            if _v.size:
+                return _v, _var
+        return None, None
+
+    def _remove_stim_step(self, sig, idx_start, idx_end, channel='red',
+                          edge='both', n_edge=3, n_gap=1, amp_override=None,
+                          batch_size=1000, verbose=True):
+        """Wrap a channel in a view with its stim-step artefact removed.
+
+        Estimates a single, spatially-uniform stimulus-triggered step
+        amplitude A for `channel` from its whole-frame mean trace (sharp
+        on/off edges, see signal_correction.estimate_stim_step_amplitude),
+        then returns a lazy _StepRemovedView over `sig` that subtracts A
+        while the visual stimulus is on screen (stim onset → reward time).
+        Each channel is estimated independently. Memmap-safe: the whole-
+        frame mean is computed in batches and the correction is applied at
+        read-time. The per-channel estimate and offset vector are stashed in
+        self.stim_step_amp[channel] / self.stim_step_offset[channel].
+
+        Parameters
+        ----------
+        sig : (T, X, Y) array-like
+            The (already time-sliced) raw channel to correct.
+        idx_start, idx_end : int
+            Frame range of `sig` within the full recording — used to slice
+            the timestamps (self.rec_t) to match.
+        channel : str
+            Name of the channel being corrected ('red' or 'grn'); keys the
+            stored estimate / offset and labels messages.
+        edge : {'both', 'on', 'off'}
+            Edges used to estimate A. 'on' is recommended for GRAB-DA, whose
+            reward-evoked transient contaminates the reward-aligned OFF edge.
+        n_edge, n_gap : int
+            Frames averaged on each side of an edge / skipped at the
+            transition.
+        amp_override : float or None
+            If given, use this amplitude instead of estimating from the data
+            (applied to whichever channel this call corrects).
+        batch_size : int
+            Frames per batch for the whole-frame mean pass.
+        verbose : bool
+
+        Returns
+        -------
+        sig_view : signal_correction._StepRemovedView or original sig
+            The step-removed view (or the unchanged input if stim timing is
+            unavailable).
+        """
+        # Need timestamps and behaviour timing to define box(t).
+        if not hasattr(self, 'rec_t') or not hasattr(self, 'beh'):
+            if verbose:
+                print('\tremove_stim_step: rec_t or beh missing — skipped')
+            return sig
+
+        t_slice = np.asarray(self.rec_t)[idx_start:idx_end]
+
+        try:
+            stim_on_t = np.asarray(self.beh.stim.t_start, dtype=float).ravel()
+        except (AttributeError, KeyError, TypeError) as _e:
+            if verbose:
+                print(f'\tremove_stim_step: stim onset timing '
+                      f'unavailable ({_e}) — skipped')
+            return sig
+        stim_off_t, _off_src = self._stim_off_times()
+        if stim_off_t is None:
+            if verbose:
+                print('\tremove_stim_step: stim-off timing unavailable '
+                      '— skipped')
+            return sig
+        if verbose and _off_src != 'stimulusOffTimes':
+            print(f'\tremove_stim_step: stimulusOffTimes missing; '
+                  f'falling back to {_off_src} for stim offset')
+
+        # Whole-frame mean trace of the raw channel (one value/frame).
+        T = sig.shape[0]
+        ch_trace = np.empty(T, dtype=np.float64)
+        for _t0 in range(0, T, batch_size):
+            _t1 = min(_t0 + batch_size, T)
+            _blk = np.asarray(sig[_t0:_t1], dtype=np.float64)
+            ch_trace[_t0:_t1] = _blk.reshape(_blk.shape[0], -1).mean(axis=1)
+
+        if amp_override is not None:
+            amp = float(amp_override)
+            if verbose:
+                print(f'\tstim-step amplitude A[{channel}] = {amp:.3f} '
+                      f'(user-supplied; raw units)')
+        else:
+            if verbose:
+                print(f'\testimating stim step for {channel}:')
+            amp, _info = signal_correction.estimate_stim_step_amplitude(
+                ch_trace, t_slice, stim_on_t, stim_off_t,
+                edge=edge, n_edge=n_edge, n_gap=n_gap, verbose=verbose)
+
+        offset = signal_correction.build_stim_step_offset(
+            t_slice, stim_on_t, stim_off_t, amp)
+
+        # Stash per-channel for inspection / QC.
+        if not isinstance(getattr(self, 'stim_step_amp', None), dict):
+            self.stim_step_amp = {}
+            self.stim_step_offset = {}
+        self.stim_step_amp[channel] = amp
+        self.stim_step_offset[channel] = offset
+        self.stim_step_edge = edge
+
+        if verbose:
+            _n_on = int((offset != 0).sum())
+            print(f'\tsubtracting stim step from {channel} over '
+                  f'{_n_on}/{T} frames (stim-on epochs)')
+
+        return signal_correction._StepRemovedView(sig, offset)
+
+    def correct_signal(self, method='full_regress', save_to_disk=False,
                        t_start=None, t_end=None, t_end_pad=10.0,
                        replace_real=True, detrend=False,
                        static_flu='grn', real_flu='red',
                        marker_size=25,
                        trialavg_t_pre=2.0, trialavg_t_post=4.0,
+                       remove_stim_step=False, stim_step_edge='both',
+                       stim_step_n_edge=3, stim_step_n_gap=1,
+                       stim_step_amp=None, stim_step_dff=False,
                        **kwargs):
         """
         Correct the real-signal channel using the static (control) channel.
@@ -808,30 +1334,18 @@ class TwoPRec_DualColour(TwoPRec):
         ----------
         method : str
             Correction method to use:
-            - 'linear': Pixel-wise OLS linear regression (default).
-              Output is the residual (real − fitted control).
-            - 'robust': Pixel-wise robust regression with Huber loss.
-            - 'linear_photom': Photometric-style pixel-wise correction
-              loosely inspired by Martianova, Aronson & Proulx, Sci.
-              Rep. 2021. Fits the control channel to the real channel
-              by per-pixel OLS, computes dF/F = (real − F̂) / F̂ using
-              the fitted control as F0, and z-scores the result per
-              pixel across time. Output is float16. Lacks lowpass /
-              airPLS / per-channel normalisation / non-negative slope —
-              for the faithful port see 'linear_martianova' below.
-            - 'linear_martianova': Faithful port of the full Martianova
-              et al. (2021) photometric pipeline. Operates on the
-              spatially-averaged 1-D control & signal traces: moving-
-              average lowpass → airPLS baseline removal → trim warm-up
-              frames → per-channel median/std normalisation → non-
-              negative OLS slope → per-pixel intercept anchored to each
-              pixel's session mean. Per-voxel ΔF/F uses the global
-              baseline-subtracted control and is z-scored per pixel
-              across time. Output is float16. See
-              signal_correction.correct_linear_martianova for the full
+            - 'full_regress' (default): full-regression photometric
+              correction (faithful port of the Martianova et al. 2019
+              pipeline). Operates on the spatially-averaged 1-D control
+              & signal traces — moving-average lowpass → airPLS baseline
+              removal → trim warm-up frames → per-channel median/std
+              normalisation → non-negative OLS slope — then applies a
+              per-voxel normalised subtraction zdFF = s2_norm − β·s1_norm.
+              Output is float16. See
+              signal_correction.correct_full_regress for the full
               parameter list (smooth_window, airpls_lam, airpls_porder,
-              airpls_max_iter, trim_initial, nn_slope,
-              per_pixel_offset).
+              airpls_max_iter, trim_initial, nn_slope, fit_mode,
+              f0_level, f0_n_sectors).
             - 'lms': LMS adaptive filter per pixel
             - 'pca': PCA-based shared variance removal
             - 'ica': ICA-based shared component removal
@@ -844,29 +1358,72 @@ class TwoPRec_DualColour(TwoPRec):
             'red' or 'grn'. (default: 'red')
         save_to_disk : bool
             If True, the correction streams its full corrected stack
-            into `{base_real}_corr.tif` via tifffile.memmap (no full-
-            volume RAM allocation), THEN derives three small trial-
-            averaged stim-aligned TIFFs by reading the relevant
-            source one trial-window at a time into a (n_win, X, Y)
-            float32 accumulator:
+            into a scratch `{base_real}_corr.tif` (beside the source
+            channel in folder.img) via tifffile.memmap (no full-volume
+            RAM allocation), THEN derives three small trial-averaged
+            stim-aligned TIFFs — written to the recording's data_mbl/
+            folder (self.folder.data) — by reading the relevant source
+            one trial-window at a time into a (n_win, X, Y) float32
+            accumulator.
 
-            - `{base_real}_corr_trialavg.tif` — corrected stack in
+            Every file written to data_mbl/ is prefixed
+            `{animal}_{date}_{beh}_` (see `_rec_file_prefix`): that
+            folder sits at the DATE level and is shared by all of a
+            date's behaviour sessions, so names built from the imaging
+            stem alone would collide — session 2 silently overwriting
+            session 1, and readers unable to tell which session a file
+            came from. Writing `{pfx}` for that prefix:
+
+            - `{pfx}{base_real}_corr_trialavg.tif` — corrected stack in
               its native units (typically z-scored ΔF/F).
-            - `{base_real}_dff_trialavg.tif`  — raw real channel
+            - `{pfx}{base_real}_dff_trialavg.tif`  — raw real channel
               converted to dF/F (%) using each pixel's mean over the
               pre-stim baseline window.
-            - `{base_static}_dff_trialavg.tif` — same for the raw
+            - `{pfx}{base_static}_dff_trialavg.tif` — same for the raw
               static channel.
 
-            All three share the trial-avg window
+            When the correction method is 'pixel_spatial_subtr' (either
+            `segmentation_type`), the per-pixel corrected trace of
+            every non-masked pixel (`self._corrected_info.mask_out`) is
+            also written, as a further *pair* of files:
+
+            - `{pfx}{base_real}_corr_pixeltraces_trial.npy` — a plain
+              (n_trials, n_win, n_valid) array of the individual trial
+              windows, in the corrected stack's own dtype (float16).
+              It is streamed to disk one trial at a time via
+              `np.lib.format.open_memmap`, so it is never resident in
+              RAM regardless of how many GB it runs to.
+            - `{pfx}{base_real}_corr_pixeltraces_trial_meta.npy` — a small
+              pickled dict with the trial-average
+              (`pixel_traces_trialavg`, (n_win, n_valid) float32), the
+              `pixel_rows` / `pixel_cols` needed to scatter traces back
+              onto the (X, Y) frame, `t_win` and the marker frames.
+
+            Read both back with `utils_twop.load_pixel_trial_traces`
+            (re-exported as `lak_exp.load_pixel_trial_traces`), which
+            memmaps the per-trial cube rather than loading it.
+
+            With `segmentation_type='cells'` on top of that, one more
+            file — `{pfx}{base_real}_corr_celltraces_trialavg.npy` — is
+            written: a pickled dict with the mean per-cell donut-ring
+            dF/F trace aligned to stim onset (`cell_traces_trialavg`,
+            (n_cells, n_win)), `cell_centroids`, `t_win` (seconds
+            relative to stim onset), and the marker frame indices.
+
+            All three TIFFs share the trial-avg window
             [−trialavg_t_pre, median(stim→rew) + trialavg_t_post]
             relative to each stim onset and the same white marker
             squares (see `marker_size`), so they can be overlaid
-            frame-for-frame in an image viewer. The full corrected
-            stack file is kept: `self.rec_{real}_corr` (and `rec_
-            {real}` if replace_real=True) points to it so downstream
-            QC / sector extraction still works against the disk-
-            backed corrected stack. (default: False)
+            frame-for-frame in an image viewer. During the call the
+            full corrected stack file is kept as scratch:
+            `self.rec_{real}_corr` (and `rec_{real}` if
+            replace_real=True) points to it so downstream QC / sector
+            extraction works against the disk-backed corrected stack,
+            and its path is recorded on `self._cs_full_stack_path`.
+            When the correction is driven through the QC pipeline,
+            add_qc deletes this scratch stack after extracting the QC
+            aggregates, so only the small trial-averaged TIFFs persist.
+            (default: False)
         replace_real : bool
             If True, replace self.rec_{real_flu} with the corrected signal
             after correction. The very first time this is done the original
@@ -901,6 +1458,51 @@ class TwoPRec_DualColour(TwoPRec):
         trialavg_t_post : float
             Seconds after the median reward time included in the
             trial-averaging window. (default: 4.0)
+        remove_stim_step : bool, optional
+            If True, detect and remove a visual-stimulus-triggered step
+            artefact from *both* channels (estimated independently per
+            channel) *before* the control-channel correction. Light from
+            the on-screen visual stimulus leaks onto the PMT(s), adding a
+            spatially-uniform additive offset that switches on at stim onset
+            and off at the visual-stimulus offset (``stimulusOffTimes``, with
+            a ``totalRewardTimes`` fallback for older Blocks). Each channel's
+            amplitude A is estimated from its whole-frame mean trace's sharp
+            on/off edges and subtracted as a lazy read-time view (memmap-
+            safe). The per-channel estimates are stored as dicts on
+            self.stim_step_amp / self.stim_step_offset, keyed by 'red' /
+            'grn'. NB: for method='pixel_spatial_subtr' prefer ``stim_step_dff``
+            — the raw whole-frame subtraction cannot flatten the leak's
+            spatial structure or its different fractional size per channel.
+            (default: False)
+        stim_step_edge : {'both', 'on', 'off'}, optional
+            Which edges to use when estimating the step amplitude.
+            'both' (default) averages the stim-onset jump and the reward-
+            time drop. For a dopamine sensor (GRAB-DA), the reward-evoked
+            transient contaminates the OFF edge — use 'on'. Ignored when
+            stim_step_amp is provided. (default: 'both')
+        stim_step_n_edge : int, optional
+            Frames averaged on each side of an edge during estimation.
+            (default: 3)
+        stim_step_n_gap : int, optional
+            Frames skipped right at each transition (the partially-
+            illuminated frame). (default: 1)
+        stim_step_amp : float or None, optional
+            If given, use this fixed step amplitude instead of estimating it
+            from the data. (default: None)
+        stim_step_dff : bool, optional
+            Per-pixel, dF/F-domain stim-step subtraction, for
+            method='pixel_spatial_subtr' only. The correct alternative to
+            ``remove_stim_step`` for that method: the unit-gain
+            dff_sig − dff_ctrl subtraction amplifies an additive light-leak
+            (whose fractional size differs between channels) and injects any
+            real control-channel stim response, so the residual is best
+            removed per pixel and in dF/F units *after* correction. The stim
+            on/off frame indices are derived here from ``beh.stim.t_start``
+            and the visual-stimulus offset (see ``_stim_off_times``) and
+            passed to ``correct_pixel_spatial_subtr``; ``stim_step_edge`` /
+            ``stim_step_n_edge`` / ``stim_step_n_gap`` control the per-pixel
+            edge estimate. Mutually exclusive with ``remove_stim_step``.
+            (default: False)
         detrend : bool, optional
             If True, remove a per-pixel linear trend from both channels before
             passing them to the correction function. Detrending is done via
@@ -920,10 +1522,11 @@ class TwoPRec_DualColour(TwoPRec):
                 dtype : np.dtype (default: np.int16)
                     Output data type
 
-            For 'linear' and 'robust':
-                huber_epsilon : float (default: 1.35, robust only)
-                max_iter : int (default: 50, robust only)
-                tol : float (default: 1e-4, robust only)
+            For 'full_regress':
+                smooth_window, airpls_lam, airpls_porder,
+                airpls_max_iter, trim_initial, nn_slope, fit_mode,
+                f0_level, f0_n_sectors (see
+                signal_correction.correct_full_regress).
 
             For 'lms':
                 filter_order : int (default: 10)
@@ -947,24 +1550,38 @@ class TwoPRec_DualColour(TwoPRec):
             if t_start/t_end specified. If save_to_disk is True, returns a
             memory-mapped array pointing to the file.
 
+        Notes
+        -----
+        Also sets ``self.rec_{real_flu}_corr``. For
+        ``method='pixel_spatial_subtr'`` the correction's ``info``
+        SimpleNamespace (masks, den, F0, gate diagnostics, and — in cell
+        mode — per-cell labels / ring traces) is stored on
+        ``self._corrected_info``; it is set to None for every other method,
+        so it always reflects the most recent correction.
+
         Examples
         --------
-        >>> # Basic linear correction (green controls red by default)
-        >>> corrected = rec.correct_signal(method='linear')
+        >>> # Default full-regress correction (green controls red)
+        >>> corrected = rec.correct_signal(method='full_regress')
 
         >>> # Correct green using red instead
         >>> corrected = rec.correct_signal(
-        ...     method='linear', static_flu='red', real_flu='grn')
+        ...     method='full_regress', static_flu='red', real_flu='grn')
 
-        >>> # Robust correction for data with outliers
+        >>> # Global (paper-faithful) β instead of per-pixel
         >>> corrected = rec.correct_signal(
-        ...     method='robust', huber_epsilon=1.5)
+        ...     method='full_regress', fit_mode='global')
+
+        >>> # One β per sector (middle ground between global & per-pixel)
+        >>> corrected = rec.correct_signal(
+        ...     method='full_regress', fit_mode='per_sector', f0_n_sectors=8)
 
         >>> # Save corrected signal directly to disk (minimal RAM usage)
-        >>> corrected = rec.correct_signal(method='linear', save_to_disk=True)
+        >>> corrected = rec.correct_signal(
+        ...     method='full_regress', save_to_disk=True)
 
         >>> # Process only first 60 seconds (for testing)
-        >>> corrected = rec.correct_signal(method='linear', t_end=60.0)
+        >>> corrected = rec.correct_signal(method='full_regress', t_end=60.0)
         """
         if static_flu == real_flu:
             raise ValueError(
@@ -1042,6 +1659,77 @@ class TwoPRec_DualColour(TwoPRec):
         self._cs_frame_range = (int(idx_start), int(idx_end))
         self._cs_n_frames_full = int(n_frames)
 
+        # Optionally remove a visual-stimulus-triggered step artefact from
+        # BOTH channels before correction, estimated independently per
+        # channel. Light from the on-screen visual stimulus leaks onto the
+        # PMT(s), adding a spatially-uniform additive offset that switches on
+        # at stim onset and off at stim offset (reward time). This is removed
+        # first — as lazy read-time views — so the downstream regression sees
+        # clean traces in both the control and the real channel.
+        # ----------
+        if remove_stim_step:
+            self.stim_step_amp = {}
+            self.stim_step_offset = {}
+            _ss_verbose = kwargs.get('verbose', True)
+            s1 = self._remove_stim_step(
+                s1, idx_start=idx_start, idx_end=idx_end,
+                channel=static_flu, edge=stim_step_edge,
+                n_edge=int(stim_step_n_edge), n_gap=int(stim_step_n_gap),
+                amp_override=stim_step_amp, verbose=_ss_verbose)
+            s2 = self._remove_stim_step(
+                s2, idx_start=idx_start, idx_end=idx_end,
+                channel=real_flu, edge=stim_step_edge,
+                n_edge=int(stim_step_n_edge), n_gap=int(stim_step_n_gap),
+                amp_override=stim_step_amp, verbose=_ss_verbose)
+
+        # Optionally enable per-pixel, dF/F-domain stim-step subtraction
+        # inside pixel_spatial_subtr. Unlike remove_stim_step (raw, whole-
+        # frame, applied to both channels before correction), this removes
+        # the leak per pixel and in dF/F units from the *corrected* trace —
+        # the correct tool for the unit-gain dff_sig - dff_ctrl subtraction,
+        # which otherwise amplifies an additive leak (different fractional
+        # size per channel) and injects any real control-channel signal.
+        # We convert stim on/off *times* to frame indices into the corrected
+        # stack (which begins at idx_start) here, so the correction needs no
+        # behaviour access. Uses the visual-stimulus offset, not reward.
+        # ----------
+        if stim_step_dff:
+            if method != 'pixel_spatial_subtr':
+                raise ValueError(
+                    "stim_step_dff is only supported for "
+                    "method='pixel_spatial_subtr'")
+            if remove_stim_step:
+                raise ValueError(
+                    "remove_stim_step (raw) and stim_step_dff (dF/F) both "
+                    "subtract the stim step; enable only one")
+            _on_t = np.asarray(self.beh.stim.t_start, dtype=float).ravel()
+            _off_t, _off_src = self._stim_off_times()
+            if _off_t is None:
+                raise ValueError(
+                    "stim_step_dff=True but stim-off timing is unavailable "
+                    "(no stimulusOffTimes / totalRewardTimes)")
+            _n = min(_on_t.size, _off_t.size)
+            _on_t, _off_t = _on_t[:_n], _off_t[:_n]
+            _te = getattr(self, 'trial_end', None)
+            if _te is not None:
+                _on_t = _on_t[:int(_te) + 1]
+                _off_t = _off_t[:int(_te) + 1]
+            _rec_t = np.asarray(self.rec_t)
+            kwargs['stim_step_dff'] = True
+            kwargs['stim_on_frames'] = np.searchsorted(_rec_t, _on_t) \
+                - idx_start
+            kwargs['stim_off_frames'] = np.searchsorted(_rec_t, _off_t) \
+                - idx_start
+            kwargs['stim_step_edge'] = stim_step_edge
+            kwargs['stim_step_n_edge'] = int(stim_step_n_edge)
+            kwargs['stim_step_n_gap'] = int(stim_step_n_gap)
+            if kwargs.get('verbose', True):
+                _src = ('' if _off_src == 'stimulusOffTimes'
+                        else f' (stim-off from {_off_src})')
+                print(f'\tstim_step_dff: per-pixel dF/F step subtraction '
+                      f'over {_on_t.size} trials, edge={stim_step_edge}'
+                      f'{_src}')
+
         # Linearly detrend both channels before correction if requested.
         # This removes slow baseline drift so the correction method
         # focuses on shared noise (motion, haemodynamics) rather than
@@ -1064,10 +1752,14 @@ class TwoPRec_DualColour(TwoPRec):
         # - output_path:    full corrected stack TIFF (memmap-backed).
         #                   The correction streams its frames directly
         #                   into this file, which bounds RAM during
-        #                   correction itself. Kept after the call so
-        #                   self.rec_{real}_corr can stay valid (the
-        #                   QC pipeline reads sectors from it) and so
-        #                   the trial-avg pass can stream-read it.
+        #                   correction itself, and self.rec_{real}_corr
+        #                   points to it so the QC pipeline can read
+        #                   sectors and the trial-avg pass can stream
+        #                   over it. It is a *scratch* file only: the
+        #                   path is recorded on self._cs_full_stack_path
+        #                   so add_qc can delete it once the trial-avg
+        #                   TIFFs and QC aggregates have been derived
+        #                   (only the small trial-averaged TIFFs persist).
         # - _trialavg_path: small (n_win, X, Y) trial-averaged TIFF
         #                   derived from the full stack. Written via
         #                   tifffile.memmap so the output is also
@@ -1075,26 +1767,62 @@ class TwoPRec_DualColour(TwoPRec):
         # ----------
         output_path = None
         _trialavg_path = None
+        self._cs_full_stack_path = None
         if save_to_disk:
             _fname_real = getattr(self, f'fname_img_{real_flu}')
             base_name, ext = os.path.splitext(_fname_real)
-            output_fname = f"{base_name}_corr{ext}"
+            # Every derived file below lands in self.folder.data
+            # (data_mbl/), which is shared by ALL behaviour sessions of a
+            # date. The imaging stem alone ('compiled_Ch1') is identical
+            # across those sessions, so naming by it let session 2
+            # silently overwrite session 1's outputs, and left readers
+            # unable to attribute a file to a session. Prefix them with
+            # the recording id — the same {animal}_{date}_{beh}
+            # convention the QC figures and .npy summaries already use.
+            _rec_prefix = self._rec_file_prefix()
+            if method == 'full_regress':
+                # For full_regress, encode the correction kwargs in the
+                # filename so the saved stack records its
+                # parameterisation. The tag is capped at whatever length
+                # is left over once the prefix, the recording's own stem
+                # and the longest suffix any file built from _corr_base
+                # carries are accounted for — otherwise a long stem plus
+                # ~17 spelled-out kwargs overflows the 255-byte limit on
+                # a name component (OSError errno 63).
+                _tag_budget = (_FNAME_MAX_LEN - len(_rec_prefix)
+                               - len(base_name)
+                               - len('_corr_') - _CORR_BASE_MAX_SUFFIX)
+                _kw_tag = _full_regress_kwarg_tag(
+                    kwargs, max_len=min(96, _tag_budget))
+                _stem_base = f"{base_name}_corr_{_kw_tag}"
+            else:
+                _stem_base = f"{base_name}_corr"
+            # data_mbl/ is shared across sessions -> prefixed stem.
+            _corr_base = f"{_rec_prefix}{_stem_base}"
+            # The scratch full stack goes to folder.img, which is already
+            # per-recording, so it keeps its historical unprefixed name.
+            output_fname = f"{_stem_base}{ext}"
+            # Scratch full stack stays beside the source channel in
+            # folder.img (it is deleted by add_qc); only the small
+            # trial-averaged TIFFs persist, and those go to data_mbl/.
             output_path = os.path.join(self.folder.img, output_fname)
             _trialavg_path = os.path.join(
-                self.folder.img,
-                f"{base_name}_corr_trialavg{ext}")
+                str(self.folder.data),
+                f"{_corr_base}_trialavg{ext}")
             kwargs['output_path'] = output_path
+            # Record the scratch full-stack path so add_qc can remove it
+            # after deriving the trial-avg TIFFs and QC aggregates.
+            self._cs_full_stack_path = output_path
 
         method_map = {
-            'linear': lambda: signal_correction.correct_linear_regression(
-                s1, s2, robust=False, **kwargs),
-            'robust': lambda: signal_correction.correct_linear_regression(
-                s1, s2, robust=True, **kwargs),
-            'linear_photom':
-                lambda: signal_correction.correct_linear_photometric(
+            'full_regress':
+                lambda: signal_correction.correct_full_regress(
                     s1, s2, **kwargs),
-            'linear_martianova':
-                lambda: signal_correction.correct_linear_martianova(
+            'two_stage':
+                lambda: signal_correction.correct_two_stage_regress(
+                    s1, s2, **kwargs),
+            'pixel_spatial_subtr':
+                lambda: signal_correction.correct_pixel_spatial_subtr(
                     s1, s2, **kwargs),
             'lms': lambda: signal_correction.correct_lms_adaptive(
                 s1, s2, **kwargs),
@@ -1116,23 +1844,38 @@ class TwoPRec_DualColour(TwoPRec):
 
         # All correction functions return corrected signal as first element.
         # When the correction was invoked with aggregates_only mode (currently
-        # supported by linear_martianova), the "signal" is actually a dict of
+        # supported by full_regress), the "signal" is actually a dict of
         # whole-frame + per-sector mean traces — short-circuit and stash on
         # self.rec_{real}_corr_aggregates rather than walking the
         # save_to_disk / replace_real paths that assume a full (T, X, Y)
         # stack. The QC pipeline reads this attribute directly.
         # ----------
         corrected = result[0]
+
+        # Stash the pixel_spatial_subtr correction's info namespace (masks,
+        # den, F0, gate diagnostics, and — in cell mode — per-cell labels /
+        # ring traces) so callers and the QC pipeline can inspect it after a
+        # plt_qc / add_qc (or direct) run. Only this method returns an info
+        # SimpleNamespace as its second value; the others return arrays or
+        # component indices there, so _corrected_info is cleared for them to
+        # keep it unambiguously tied to the most recent correction.
+        if method == 'pixel_spatial_subtr' and len(result) > 1:
+            self._corrected_info = result[1]
+        else:
+            self._corrected_info = None
+
         if isinstance(corrected, dict) and corrected.get('is_aggregates'):
             setattr(self, f'rec_{real_flu}_corr_aggregates', corrected)
             return
 
         # save_to_disk path: write three trial-averaged TIFFs derived
-        # from the same stim window — the corrected stack (native
-        # units, typically z-scored ΔF/F), and dF/F (%) trial-averages
-        # of the raw real and static channels. All three share the
-        # same n_win / stim-frame / rew-frame layout and markers so
-        # they can be overlaid frame-for-frame in an image viewer.
+        # from the same stim window — the corrected stack (per-pixel
+        # baseline-subtracted z-scored ΔF/F, so the pre-stim period is
+        # uniformly black and only responsive pixels light up after
+        # stim), and dF/F (%) trial-averages of the raw real and static
+        # channels. All three share the same n_win / stim-frame /
+        # rew-frame layout and markers so they can be overlaid
+        # frame-for-frame in an image viewer.
         # The full corrected stack file is kept so self.rec_{real}_
         # corr (set below) stays valid for downstream consumers
         # (e.g. the QC sector / whole-frame extractors).
@@ -1147,6 +1890,7 @@ class TwoPRec_DualColour(TwoPRec):
                 t_pre=float(trialavg_t_pre),
                 t_post=float(trialavg_t_post),
                 dff=False,
+                baseline_subtract=True,
                 label=f'{real_flu}_corr',
                 verbose=_verb)
 
@@ -1158,8 +1902,8 @@ class TwoPRec_DualColour(TwoPRec):
                 _base = os.path.splitext(
                     getattr(self, f'fname_img_{_flu}'))[0]
                 _dff_path = os.path.join(
-                    str(self.folder.img),
-                    f'{_base}_dff_trialavg.tif')
+                    str(self.folder.data),
+                    f'{_rec_prefix}{_base}_dff_trialavg.tif')
                 try:
                     self._save_trial_avg_to_disk(
                         source=_src,
@@ -1175,6 +1919,53 @@ class TwoPRec_DualColour(TwoPRec):
                     if _verb:
                         print(f'\twarning: dF/F trial-avg for '
                               f'{_flu} failed ({_e})')
+
+            # Per-pixel (non-masked, i.e. mask_out=True) corrected
+            # traces, individual-trial windows AND their trial-average,
+            # for whichever segmentation_type ('gmm' or 'cells') the
+            # correction used — mask_out always exists on
+            # self._corrected_info for pixel_spatial_subtr.
+            # ----------
+            if (self._corrected_info is not None
+                    and getattr(self._corrected_info, 'mask_out', None)
+                    is not None):
+                _pix_path = os.path.join(
+                    str(self.folder.data),
+                    f'{_corr_base}_pixeltraces_trial.npy')
+                try:
+                    self._save_pixel_trial_traces_to_disk(
+                        source=corrected,
+                        idx_start=idx_start,
+                        output_path=_pix_path,
+                        t_pre=float(trialavg_t_pre),
+                        t_post=float(trialavg_t_post),
+                        verbose=_verb)
+                except Exception as _e:
+                    if _verb:
+                        print(f'\twarning: per-pixel trial traces '
+                              f'failed ({_e})')
+
+            # Cell mode also emits mean per-cell donut-ring traces,
+            # trial-aligned to stim onset, alongside the trial-avg TIFFs.
+            # ----------
+            if (kwargs.get('segmentation_type') == 'cells'
+                    and self._corrected_info is not None
+                    and getattr(self._corrected_info, 'cell_traces', None)
+                    is not None):
+                _cell_path = os.path.join(
+                    str(self.folder.data),
+                    f'{_corr_base}_celltraces_trialavg.npy')
+                try:
+                    self._save_cell_trialavg_traces_to_disk(
+                        idx_start=idx_start,
+                        output_path=_cell_path,
+                        t_pre=float(trialavg_t_pre),
+                        t_post=float(trialavg_t_post),
+                        verbose=_verb)
+                except Exception as _e:
+                    if _verb:
+                        print(f'\twarning: per-cell trial-avg traces '
+                              f'failed ({_e})')
 
         # Store corrected signal on the channel-specific attribute
         setattr(self, f'rec_{real_flu}_corr', corrected)
@@ -1198,6 +1989,7 @@ class TwoPRec_DualColour(TwoPRec):
                                   output_path, marker_size=25,
                                   t_pre=2.0, t_post=4.0,
                                   dff=False, dff_eps=1e-6,
+                                  baseline_subtract=False,
                                   label='source',
                                   verbose=True):
         """Trial-average a (T, X, Y) source stack and save as a
@@ -1236,6 +2028,20 @@ class TwoPRec_DualColour(TwoPRec):
             (set to 0) to avoid division blow-up.
         dff_eps : float
             Floor for |F0| in the dF/F divide.
+        baseline_subtract : bool
+            If True, subtract each pixel's mean over the pre-stim
+            baseline window (first `_n_pre` frames) from the whole
+            trial-averaged trace — a pure SUBTRACTION, no divide. This
+            is the correct baseline normalisation for an already-
+            normalised input (e.g. the z-scored ΔF/F corrected channel,
+            whose per-pixel baseline ≈ 0 makes a dF/F divide unstable).
+            The pre-stim period becomes ≈ 0 everywhere (uniformly black)
+            and only stim-responsive pixels deviate, so anatomical
+            structure no longer shows through the baseline. Output dtype
+            becomes float32. Mutually exclusive with `dff`. The white
+            frame markers are placed at an on-scale bright value
+            (response 99.9th percentile) rather than the dtype max, so
+            they do not crush the display contrast.
         label : str
             Label used in verbose log lines (e.g. 'red', 'grn',
             'corrected').
@@ -1245,6 +2051,9 @@ class TwoPRec_DualColour(TwoPRec):
             raise ValueError(
                 f"source must be 3D (T, X, Y); got "
                 f"{getattr(source, 'shape', type(source))}")
+        if dff and baseline_subtract:
+            raise ValueError(
+                "dff and baseline_subtract are mutually exclusive")
         T, X, Y = source.shape
         _dtype = source.dtype
 
@@ -1307,7 +2116,9 @@ class TwoPRec_DualColour(TwoPRec):
             0, min(_n_pre + int(round(_rew_lat / _dt)), _n_win - 1))
 
         if verbose:
-            _mode = 'dF/F %' if dff else 'native'
+            _mode = ('dF/F %' if dff
+                     else 'baseline-subtracted' if baseline_subtract
+                     else 'native')
             print(f'\ttrial-averaging [{label}] ({_mode}):')
             print(f'\t\twindow: [-{t_pre:.2f}, '
                   f'{_rew_lat + t_post:.2f}]s '
@@ -1318,9 +2129,15 @@ class TwoPRec_DualColour(TwoPRec):
 
         # Accumulator in float32 for precision; one window-sized
         # buffer (~n_win × X × Y × 4 bytes) plus one per-trial chunk
-        # of the same size, transiently.
+        # of the same size, transiently. NaN-aware: a per-trial (f0_mode=
+        # 'per_trial') corrected stack is NaN outside each trial's window
+        # and at non-mask_out pixels, so accumulation is done with
+        # nansum plus a per-cell finite count. A (frame, pixel) cell is
+        # averaged over however many trials actually covered it, and stays
+        # NaN only where no trial contributed a finite value.
         # ----------
         _acc = np.zeros((_n_win, X, Y), dtype=np.float32)
+        _n_fin = np.zeros((_n_win, X, Y), dtype=np.int32)
         _count = 0
         for _ev_idx, _ev in enumerate(_stim_t):
             _i = int(np.argmin(np.abs(_t_local - _ev)))
@@ -1331,7 +2148,9 @@ class TwoPRec_DualColour(TwoPRec):
             _chunk = np.asarray(source[_i0:_i1], dtype=np.float32)
             if _chunk.shape != _acc.shape:
                 continue
-            _acc += _chunk
+            _fin = np.isfinite(_chunk)
+            np.add(_acc, np.where(_fin, _chunk, np.float32(0.0)), out=_acc)
+            _n_fin += _fin
             _count += 1
             if verbose:
                 print(f'\t\t\ttrial {_ev_idx + 1}/{_stim_t.size} '
@@ -1344,8 +2163,10 @@ class TwoPRec_DualColour(TwoPRec):
                 "no trials survived the window filter; "
                 "cannot trial-average")
 
-        _avg_f32 = _acc / float(_count)
-        del _acc
+        with np.errstate(invalid='ignore', divide='ignore'):
+            _avg_f32 = (_acc / _n_fin).astype(np.float32)
+        _avg_f32[_n_fin == 0] = np.nan
+        del _acc, _n_fin
 
         # Optional dF/F (%) transform using per-pixel mean over the
         # pre-stim baseline window. Output stays as float32 in this
@@ -1357,7 +2178,8 @@ class TwoPRec_DualColour(TwoPRec):
                 raise ValueError(
                     f"dff=True requires at least 1 pre-stim frame; "
                     f"got _n_pre={_n_pre} (t_pre={t_pre}s, dt={_dt}s)")
-            _f0 = _avg_f32[:_n_pre].mean(axis=0)
+            with np.errstate(invalid='ignore'):
+                _f0 = np.nanmean(_avg_f32[:_n_pre], axis=0)
             _f0_safe = np.where(np.abs(_f0) >= dff_eps, _f0, 1.0)
             with np.errstate(invalid='ignore', divide='ignore'):
                 _avg_out = ((_avg_f32 - _f0[None]) / _f0_safe[None]
@@ -1365,6 +2187,21 @@ class TwoPRec_DualColour(TwoPRec):
             _bad = np.abs(_f0) < dff_eps
             if np.any(_bad):
                 _avg_out[:, _bad] = 0.0
+            _out_dtype = np.float32
+        elif baseline_subtract:
+            # Per-pixel pre-stim baseline SUBTRACTION (no divide). The
+            # baseline window becomes ≈ 0 for every pixel, so the stack
+            # is uniformly black until stim and only responsive pixels
+            # deviate. Correct for already-normalised inputs (z-scored
+            # ΔF/F) where a dF/F divide would blow up on near-zero F0.
+            if _n_pre < 1:
+                raise ValueError(
+                    f"baseline_subtract=True requires at least 1 "
+                    f"pre-stim frame; got _n_pre={_n_pre} "
+                    f"(t_pre={t_pre}s, dt={_dt}s)")
+            with np.errstate(invalid='ignore'):
+                _f0 = np.nanmean(_avg_f32[:_n_pre], axis=0)
+            _avg_out = _avg_f32 - _f0[None]
             _out_dtype = np.float32
         else:
             _avg_out = _avg_f32.astype(_dtype)
@@ -1397,7 +2234,19 @@ class TwoPRec_DualColour(TwoPRec):
         _ms = int(min(marker_size, X, Y))
         if _ms > 0:
             _dt_norm = np.dtype(_out_dtype)
-            if np.issubdtype(_dt_norm, np.integer):
+            if baseline_subtract:
+                # On-scale bright marker: the 99.9th percentile of the
+                # (signed) response, so the marker is the brightest thing
+                # on screen without saturating the auto-contrast that
+                # keeps the baseline black. Fall back to the data max if
+                # the percentile is non-finite or non-positive.
+                _hi = float(np.nanpercentile(np.asarray(_out), 99.9))
+                if not np.isfinite(_hi) or _hi <= 0:
+                    _hi = float(np.nanmax(np.asarray(_out)))
+                if not np.isfinite(_hi) or _hi <= 0:
+                    _hi = 1.0
+                _white = _dt_norm.type(_hi)
+            elif np.issubdtype(_dt_norm, np.integer):
                 _white = _dt_norm.type(np.iinfo(_dt_norm).max)
             else:
                 _white = _dt_norm.type(np.finfo(_dt_norm).max)
@@ -1411,6 +2260,374 @@ class TwoPRec_DualColour(TwoPRec):
                       f'(rew onset, lat={_rew_lat:.2f}s)')
 
         del _out
+
+    def _save_pixel_trial_traces_to_disk(self, source, idx_start,
+                                           output_path,
+                                           t_pre=2.0, t_post=4.0,
+                                           dtype=None, flush_every=10,
+                                           verbose=True):
+        """Save per-trial AND trial-averaged traces for valid pixels.
+
+        Companion to ``_save_trial_avg_to_disk`` /
+        ``_save_cell_trialavg_traces_to_disk``: rather than only keeping
+        the across-trial average image stack, this keeps every trial's
+        window individually for every non-masked pixel
+        (``self._corrected_info.mask_out``), which per-pixel statistics
+        across trials need and a spatial/trial average would wash out.
+        Works identically for ``segmentation_type='gmm'`` and
+        ``'cells'`` — ``mask_out`` is populated either way.
+
+        Two files are written:
+
+        - ``output_path`` — a plain (n_trials, n_win, n_valid) .npy
+          array, allocated with ``np.lib.format.open_memmap`` and
+          filled one trial at a time. The cube is *never* resident in
+          RAM, either while building it or while saving it, so peak
+          usage is bounded by one (n_win, n_valid) window plus the
+          two (n_win, n_valid) trial-average accumulators.
+        - ``{stem}_meta.npy`` — a small pickled dict holding the
+          trial-average and everything needed to interpret the cube
+          (pixel_rows / pixel_cols, t_win, marker frames, shapes).
+
+        Read both back with
+        ``utils_twop.load_pixel_trial_traces``, which memmaps the cube
+        rather than loading it.
+
+        Parameters
+        ----------
+        source : np.ndarray or memmap, (T, X, Y)
+            Corrected per-pixel stack (e.g. the return value of
+            ``correct_pixel_spatial_subtr`` / ``self.rec_{real}_corr``).
+        idx_start : int
+            Frame offset into self.rec_t at which source[0] lives.
+        output_path : str
+            Destination .npy path for the per-trial cube. The metadata
+            sidecar path is derived from it.
+        t_pre, t_post : float
+            See ``_save_trial_avg_to_disk``.
+        dtype : np.dtype or None
+            Storage dtype of the per-trial cube. None (default) keeps
+            `source`'s own dtype when it is a float type — the
+            corrected stack is float16, so this neither loses precision
+            nor doubles the file — and falls back to float32 otherwise.
+        flush_every : int
+            Flush the memmap every this many trials, to bound dirty
+            page accumulation when writing to a slow/external volume.
+        verbose : bool
+
+        Notes
+        -----
+        Output size scales as ``n_trials * n_win * n_valid_pixels``,
+        which can be large on disk (``n_valid`` is typically about a
+        third to a half of the FOV) even though RAM stays bounded.
+        """
+        info = self._corrected_info
+        mask_out = np.asarray(info.mask_out, dtype=bool)
+        if not mask_out.any():
+            raise ValueError(
+                "mask_out has no valid pixels; nothing to save")
+        _rows, _cols = np.nonzero(mask_out)
+        n_valid = _rows.size
+
+        if not hasattr(source, 'shape') or source.ndim != 3:
+            raise ValueError(
+                f"source must be 3D (T, X, Y); got "
+                f"{getattr(source, 'shape', type(source))}")
+        T, X, Y = source.shape
+        if mask_out.shape != (X, Y):
+            raise ValueError(
+                f"mask_out shape {mask_out.shape} does not match "
+                f"source frame shape {(X, Y)}")
+
+        _t_local = np.asarray(self.rec_t[idx_start:idx_start + T],
+                              dtype=np.float64)
+        if _t_local.size < 2:
+            raise ValueError(
+                f"need at least 2 frames of rec_t for pixel trial "
+                f"traces; got {_t_local.size}")
+        _dt = float(np.median(np.diff(_t_local)))
+
+        _stim_t = np.asarray(getattr(self.beh.stim, 't_start', []),
+                             dtype=np.float64).ravel()
+        _stim_t = _stim_t[np.isfinite(_stim_t)]
+        _stim_in = ((_stim_t >= _t_local[0])
+                    & (_stim_t <= _t_local[-1]))
+        _stim_t = _stim_t[_stim_in]
+
+        # Reward times, paired to stims, only to size the window and
+        # place the reward marker frame (same logic as
+        # _save_trial_avg_to_disk).
+        # ----------
+        _rew_raw = np.asarray(getattr(self.beh.rew, 't', []),
+                              dtype=object).ravel()
+        _rew_clean = []
+        for _v in _rew_raw:
+            try:
+                _f = float(_v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(_f):
+                _rew_clean.append(_f)
+        _rew_t = np.sort(np.asarray(_rew_clean, dtype=np.float64))
+
+        _max_pair_lat = 5.0
+        _lats = []
+        if _stim_t.size and _rew_t.size:
+            _idx = np.searchsorted(_rew_t, _stim_t, side='right')
+            for _i, _ri in enumerate(_idx):
+                if _ri >= _rew_t.size:
+                    continue
+                _l = float(_rew_t[_ri] - _stim_t[_i])
+                if 0 < _l <= _max_pair_lat:
+                    _lats.append(_l)
+        _rew_lat = float(np.median(_lats)) if _lats else 0.0
+
+        _n_pre = int(round(t_pre / _dt))
+        _n_post = int(round((_rew_lat + t_post) / _dt))
+        _n_win = _n_pre + _n_post + 1
+        _stim_frame_in_win = _n_pre
+        _rew_frame_in_win = max(
+            0, min(_n_pre + int(round(_rew_lat / _dt)), _n_win - 1))
+
+        # First pass: which stim events have a fully in-range window.
+        # ----------
+        _win_starts = []
+        for _ev in _stim_t:
+            _i = int(np.argmin(np.abs(_t_local - _ev)))
+            _i0 = _i - _n_pre
+            _i1 = _i + _n_post + 1
+            if _i0 < 0 or _i1 > T:
+                continue
+            _win_starts.append(_i0)
+        n_trials = len(_win_starts)
+
+        # Storage dtype: keep source's own float dtype (the corrected
+        # stack is float16, so an upcast would double both RAM and file
+        # size without adding precision), but never silently downcast a
+        # non-float source.
+        # ----------
+        if dtype is None:
+            _src_dt = np.dtype(getattr(source, 'dtype', np.float32))
+            _dtype = _src_dt if np.issubdtype(_src_dt, np.floating) \
+                else np.dtype(np.float32)
+        else:
+            _dtype = np.dtype(dtype)
+
+        _meta_path = f'{os.path.splitext(output_path)[0]}_meta.npy'
+
+        if verbose:
+            _gb = n_trials * _n_win * n_valid * _dtype.itemsize / 1e9
+            print(f'\tper-pixel trial traces (valid pixels only):')
+            print(f'\t\twindow: [-{t_pre:.2f}, '
+                  f'{_rew_lat + t_post:.2f}]s '
+                  f'(median stim->rew={_rew_lat:.2f}s)')
+            print(f'\t\tframes: {_n_win} ({_n_pre} pre, {_n_post} post), '
+                  f'dt={_dt:.4f}s, valid pixels: {n_valid}')
+            print(f'\t\tincluded {n_trials}/{_stim_t.size} trials')
+            print(f'\t\tstreaming {_gb:.2f} GB as {_dtype} to: '
+                  f'{output_path}')
+
+        if n_trials == 0:
+            raise ValueError(
+                "no trials survived the window filter; "
+                "cannot extract per-pixel trial traces")
+
+        # The per-trial cube is written straight into a disk-backed .npy
+        # (mode='w+' creates/truncates), one trial window at a time, and
+        # the trial-average is accumulated NaN-aware alongside it — same
+        # pattern as _save_trial_avg_to_disk, but reduced to valid
+        # pixels. Nothing of size (n_trials, n_win, n_valid) is ever
+        # held in RAM, which matters: at ~90k valid pixels and ~120
+        # window frames the cube runs to several GB.
+        # ----------
+        pertrial = np.lib.format.open_memmap(
+            output_path, mode='w+', dtype=_dtype,
+            shape=(n_trials, _n_win, n_valid))
+        _acc = np.zeros((_n_win, n_valid), dtype=np.float32)
+        _n_fin = np.zeros((_n_win, n_valid), dtype=np.int32)
+        try:
+            for _k, _i0 in enumerate(_win_starts):
+                # Fancy-index the source view directly so the temporary
+                # is (n_win, n_valid), not a full (n_win, X, Y) frame
+                # block that is then thrown away.
+                _win = np.asarray(source[_i0:_i0 + _n_win])[:, _rows, _cols]
+                pertrial[_k] = _win
+
+                _w32 = _win.astype(np.float32, copy=False)
+                _fin = np.isfinite(_w32)
+                np.add(_acc, np.where(_fin, _w32, np.float32(0.0)), out=_acc)
+                _n_fin += _fin
+
+                if flush_every and (_k + 1) % int(flush_every) == 0:
+                    pertrial.flush()
+                if verbose:
+                    print(f'\t\t\ttrial {_k + 1}/{n_trials}', end='\r')
+            pertrial.flush()
+        finally:
+            del pertrial
+        if verbose:
+            print()
+
+        with np.errstate(invalid='ignore', divide='ignore'):
+            trialavg = (_acc / _n_fin).astype(np.float32)
+        trialavg[_n_fin == 0] = np.nan
+        del _acc, _n_fin
+
+        _t_win = (np.arange(_n_win) - _stim_frame_in_win) * _dt
+
+        if verbose:
+            print(f'\twriting per-pixel trace metadata to: {_meta_path}')
+        np.save(_meta_path, {
+            'pixel_traces_trialavg': trialavg,
+            'pixel_rows': _rows.astype(np.int32),
+            'pixel_cols': _cols.astype(np.int32),
+            'frame_shape': (int(X), int(Y)),
+            't_win': _t_win,
+            'stim_frame_in_win': int(_stim_frame_in_win),
+            'rew_frame_in_win': int(_rew_frame_in_win),
+            'n_trials': int(n_trials),
+            'n_win': int(_n_win),
+            'n_valid': int(n_valid),
+            'pertrial_dtype': str(_dtype),
+            'pertrial_file': os.path.basename(output_path),
+        }, allow_pickle=True)
+
+    def _save_cell_trialavg_traces_to_disk(self, idx_start, output_path,
+                                             t_pre=2.0, t_post=4.0,
+                                             verbose=True):
+        """Trial-average the per-cell donut-ring dF/F traces and save.
+
+        Companion to ``_save_trial_avg_to_disk``: instead of a (T, X, Y)
+        image stack, this averages ``self._corrected_info.cell_traces``
+        (K, T) — the per-cell ring traces emitted by
+        ``signal_correction.correct_pixel_spatial_subtr`` under
+        ``segmentation_type='cells'`` — over the same stim-aligned
+        window [-t_pre, median(stim->rew) + t_post]. NaN-aware: a cell
+        with no finite samples in a given window frame (e.g. outside its
+        trial window under ``f0_mode='per_trial'``) stays NaN there
+        rather than pulling the mean toward 0.
+
+        Parameters
+        ----------
+        idx_start : int
+            Frame offset into self.rec_t at which cell_traces[:, 0] lives.
+        output_path : str
+            Destination .npy path. Saved as a single pickled dict (via
+            ``np.save(..., allow_pickle=True)``).
+        t_pre, t_post : float
+            See ``_save_trial_avg_to_disk``.
+        verbose : bool
+        """
+        info = self._corrected_info
+        if info is None or getattr(info, 'cell_traces', None) is None:
+            raise ValueError(
+                "no per-cell traces available; correct_signal must have "
+                "been run with method='pixel_spatial_subtr' and "
+                "segmentation_type='cells'")
+        traces = np.asarray(info.cell_traces)
+        n_cells, T = traces.shape
+
+        _t_local = np.asarray(self.rec_t[idx_start:idx_start + T],
+                              dtype=np.float64)
+        if _t_local.size < 2:
+            raise ValueError(
+                f"need at least 2 frames of rec_t for cell trial-avg; "
+                f"got {_t_local.size}")
+        _dt = float(np.median(np.diff(_t_local)))
+
+        _stim_t = np.asarray(getattr(self.beh.stim, 't_start', []),
+                             dtype=np.float64).ravel()
+        _stim_t = _stim_t[np.isfinite(_stim_t)]
+        _stim_in = ((_stim_t >= _t_local[0])
+                    & (_stim_t <= _t_local[-1]))
+        _stim_t = _stim_t[_stim_in]
+
+        # Reward times, paired to stims, only to size the window and
+        # place the reward marker frame (same logic as
+        # _save_trial_avg_to_disk).
+        # ----------
+        _rew_raw = np.asarray(getattr(self.beh.rew, 't', []),
+                              dtype=object).ravel()
+        _rew_clean = []
+        for _v in _rew_raw:
+            try:
+                _f = float(_v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(_f):
+                _rew_clean.append(_f)
+        _rew_t = np.sort(np.asarray(_rew_clean, dtype=np.float64))
+
+        _max_pair_lat = 5.0
+        _lats = []
+        if _stim_t.size and _rew_t.size:
+            _idx = np.searchsorted(_rew_t, _stim_t, side='right')
+            for _i, _ri in enumerate(_idx):
+                if _ri >= _rew_t.size:
+                    continue
+                _l = float(_rew_t[_ri] - _stim_t[_i])
+                if 0 < _l <= _max_pair_lat:
+                    _lats.append(_l)
+        _rew_lat = float(np.median(_lats)) if _lats else 0.0
+
+        _n_pre = int(round(t_pre / _dt))
+        _n_post = int(round((_rew_lat + t_post) / _dt))
+        _n_win = _n_pre + _n_post + 1
+        _stim_frame_in_win = _n_pre
+        _rew_frame_in_win = max(
+            0, min(_n_pre + int(round(_rew_lat / _dt)), _n_win - 1))
+
+        if verbose:
+            print(f'\ttrial-averaging [cell donut traces]:')
+            print(f'\t\twindow: [-{t_pre:.2f}, '
+                  f'{_rew_lat + t_post:.2f}]s '
+                  f'(median stim->rew={_rew_lat:.2f}s)')
+            print(f'\t\tframes: {_n_win} ({_n_pre} pre, {_n_post} post), '
+                  f'dt={_dt:.4f}s, cells: {n_cells}')
+            print(f'\t\tstim events in range: {_stim_t.size}')
+
+        _acc = np.zeros((n_cells, _n_win), dtype=np.float32)
+        _n_fin = np.zeros((n_cells, _n_win), dtype=np.int32)
+        _count = 0
+        for _ev in _stim_t:
+            _i = int(np.argmin(np.abs(_t_local - _ev)))
+            _i0 = _i - _n_pre
+            _i1 = _i + _n_post + 1
+            if _i0 < 0 or _i1 > T:
+                continue
+            _chunk = traces[:, _i0:_i1].astype(np.float32)
+            _fin = np.isfinite(_chunk)
+            np.add(_acc, np.where(_fin, _chunk, np.float32(0.0)), out=_acc)
+            _n_fin += _fin
+            _count += 1
+
+        if verbose:
+            print(f'\t\tincluded {_count}/{_stim_t.size} trials')
+        if _count == 0:
+            raise ValueError(
+                "no trials survived the window filter; "
+                "cannot trial-average cell traces")
+
+        with np.errstate(invalid='ignore', divide='ignore'):
+            _avg = (_acc / _n_fin).astype(np.float32)
+        _avg[_n_fin == 0] = np.nan
+        del _acc, _n_fin
+
+        _t_win = (np.arange(_n_win) - _stim_frame_in_win) * _dt
+
+        if verbose:
+            print(f'\twriting per-cell trial-averaged traces to: '
+                  f'{output_path}')
+        np.save(output_path, {
+            'cell_traces_trialavg': _avg,
+            'cell_centroids': (np.asarray(info.cell_centroids)
+                                if info.cell_centroids is not None
+                                else None),
+            't_win': _t_win,
+            'stim_frame_in_win': int(_stim_frame_in_win),
+            'rew_frame_in_win': int(_rew_frame_in_win),
+            'n_trials': int(_count),
+        }, allow_pickle=True)
 
     def _stamp_corr_event_markers(self, corrected, idx_start=0,
                                    marker_size=8, output_path=None,

@@ -1,6 +1,7 @@
 import numpy as np
 import scipy as sp
 import os
+import warnings
 import scipy.signal as sp_signal
 import matplotlib.pyplot as plt
 from types import SimpleNamespace
@@ -9,6 +10,56 @@ try:
     plt.style.use('publication_ml')
 except:
     pass
+
+
+def nanmean(a, axis=None):
+    """np.nanmean without the all-NaN-slice RuntimeWarning.
+
+    Correctors that gate on pixel quality (e.g.
+    ``signal_correction.correct_pixel_spatial_subtr``) mark rejected pixels
+    with NaN, so any reduction *across* pixels must skip them or a single
+    rejected pixel poisons the whole sector / frame / mask. A reduction
+    over an entirely rejected region legitimately gives NaN — that is the
+    answer, not a warning worth printing.
+
+    Parameters
+    ----------
+    a : array_like
+        Input array.
+    axis : int or tuple of int or None
+        Axis / axes to reduce over.
+
+    Returns
+    -------
+    out : np.ndarray or float
+        Mean over the non-NaN entries; NaN where a slice is all-NaN.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return np.nanmean(a, axis=axis)
+
+
+def fmt_kwarg_val(val):
+    """Render a kwarg value as a compact, filename-safe token.
+
+    Used to build filename tags that record the exact parameterisation a
+    saved file was produced with.
+
+    Parameters
+    ----------
+    val : object
+        The kwarg value (type, float, or anything with a useful str()).
+
+    Returns
+    -------
+    token : str
+        e.g. ``float16``, ``1e-06``, ``per_pixel``.
+    """
+    if isinstance(val, type):
+        return val.__name__
+    if isinstance(val, float):
+        return repr(val)
+    return str(val).replace(' ', '')
 
 
 # Tools to load and preprocess dataset

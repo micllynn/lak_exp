@@ -841,7 +841,7 @@ def run_correction_method_comparison(dset_obj,
         Number of trials to load (passed as trial_end). (default: 100)
     methods : list of str or None
         Correction methods to apply in order.
-        If None, defaults to ['linear', 'robust', 'pca', 'nmf'].
+        If None, defaults to ['full_regress', 'lms'].
     n_sectors : int
         Number of spatial sectors in each dimension. (default: 10)
     t_pre : float
@@ -852,7 +852,7 @@ def run_correction_method_comparison(dset_obj,
         Skip all recordings with index below this value. (default: 0)
     """
     if methods is None:
-        methods = ['linear', 'robust', 'lms']
+        methods = ['full_regress', 'lms']
 
     n_recs = dset_obj._dset_raw['expref'].shape[0]
 

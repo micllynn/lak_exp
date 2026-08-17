@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import os, re
 import gc
 import xml.etree.ElementTree as ElementTree
+from types import SimpleNamespace
 
 
 def _batch_sort_key(fname):
@@ -272,6 +273,82 @@ def calc_dff(trace, baseline_frames):
     return dff
 
 
+def load_pixel_trial_traces(path, mmap=True):
+    """Load per-pixel per-trial traces written by TwoPRec.correct_signal.
+
+    Reads the pair of files emitted by
+    ``TwoPRec._save_pixel_trial_traces_to_disk`` (via
+    ``correct_signal(save_to_disk=True, method='pixel_spatial_subtr')``):
+    a plain ``{base}_corr_pixeltraces_trial.npy`` array of shape
+    (n_trials, n_win, n_valid) and its ``..._trial_meta.npy`` sidecar.
+
+    The cube is memmapped by default, so a multi-GB file costs no RAM
+    until it is sliced. It is typically float16 (matching the corrected
+    stack) — cast slices to float32 before doing arithmetic on them.
+
+    Parameters
+    ----------
+    path : str
+        Either file of the pair; the other is resolved from it.
+    mmap : bool
+        If True (default), the per-trial cube is opened with
+        ``mmap_mode='r'`` rather than read into RAM.
+
+    Returns
+    -------
+    out : SimpleNamespace
+        .pertrial : (n_trials, n_win, n_valid) array or memmap
+        .trialavg : (n_win, n_valid) float32, NaN-aware trial mean
+        .rows, .cols : (n_valid,) int32 pixel coordinates, so that
+            ``frame[out.rows, out.cols] = out.trialavg[i]`` scatters a
+            window frame back onto the (X, Y) FOV
+        .frame_shape : (X, Y)
+        .t_win : (n_win,) seconds relative to stim onset
+        .stim_frame_in_win, .rew_frame_in_win : int
+        .n_trials : int
+        .paths : SimpleNamespace with .pertrial / .meta
+    """
+    _p = str(path)
+    _stem, _ext = os.path.splitext(_p)
+    if _stem.endswith('_meta'):
+        _meta_path = _p
+        _arr_path = f'{_stem[:-len("_meta")]}{_ext}'
+    else:
+        _arr_path = _p
+        _meta_path = f'{_stem}_meta{_ext}'
+
+    if not os.path.exists(_meta_path):
+        raise FileNotFoundError(
+            f"metadata sidecar not found: {_meta_path}. Files written "
+            f"before the streaming rewrite packed everything into a "
+            f"single pickled dict; re-run the QC to regenerate them.")
+    if not os.path.exists(_arr_path):
+        raise FileNotFoundError(
+            f"per-trial cube not found: {_arr_path}")
+
+    meta = np.load(_meta_path, allow_pickle=True).item()
+
+    pertrial = np.load(_arr_path, mmap_mode='r' if mmap else None,
+                       allow_pickle=False)
+    if pertrial.ndim != 3:
+        raise ValueError(
+            f"{_arr_path} is not a (n_trials, n_win, n_valid) array "
+            f"(got ndim={pertrial.ndim}); re-run the QC to regenerate "
+            f"it in the current format.")
+
+    return SimpleNamespace(
+        pertrial=pertrial,
+        trialavg=meta['pixel_traces_trialavg'],
+        rows=meta['pixel_rows'],
+        cols=meta['pixel_cols'],
+        frame_shape=meta['frame_shape'],
+        t_win=meta['t_win'],
+        stim_frame_in_win=meta['stim_frame_in_win'],
+        rew_frame_in_win=meta['rew_frame_in_win'],
+        n_trials=meta['n_trials'],
+        paths=SimpleNamespace(pertrial=_arr_path, meta=_meta_path))
+
+
 def clearmem():
     """
     Clear matplotlib figures and force garbage collection.
@@ -323,16 +400,55 @@ class XMLParser(object):
         """
         Extract framerate from XML file based on frame timestamps.
 
+        Uses the mean inter-frame interval across all frames in the
+        T-series (the most robust estimate of the true mean frame rate),
+        computed from the first and last ``absoluteTime`` of every
+        ``<Frame>`` element. Falls back to a single inter-frame interval
+        (frames 2-3) if fewer than two frame timestamps are found.
+
         Returns
         -------
         framerate : float
             Imaging framerate in Hz.
         """
-        # framerate = 1/float(self.root[2][1][3][0].attrib['value'])
-        t_frame1 = float(self.root[2][2].attrib['absoluteTime'])
-        t_frame2 = float(self.root[2][3].attrib['absoluteTime'])
-        framerate = 1 / (t_frame2 - t_frame1)
+        _t = [float(_f.attrib['absoluteTime'])
+              for _f in self.root.iter('Frame')
+              if 'absoluteTime' in _f.attrib]
+        if len(_t) >= 2:
+            _t = np.asarray(_t, dtype=np.float64)
+            framerate = (_t.size - 1) / (_t[-1] - _t[0])
+        else:
+            # fallback: single inter-frame interval (frames 2-3)
+            t_frame1 = float(self.root[2][2].attrib['absoluteTime'])
+            t_frame2 = float(self.root[2][3].attrib['absoluteTime'])
+            framerate = 1 / (t_frame2 - t_frame1)
         return framerate
+
+    def get_microns_per_pixel(self):
+        """Extract microns-per-pixel for the X and Y axes.
+
+        Searches the PVStateValue with key 'micronsPerPixel' (PrairieView
+        / Bruker BACKUP.xml) and reads its XAxis / YAxis IndexedValues.
+
+        Returns
+        -------
+        microns : dict
+            {'x': float, 'y': float} microns per pixel for each axis.
+        """
+        microns = {}
+        for _pv in self.root.iter('PVStateValue'):
+            if _pv.attrib.get('key') == 'micronsPerPixel':
+                for _iv in _pv.iter('IndexedValue'):
+                    _ax = _iv.attrib.get('index')
+                    if _ax == 'XAxis':
+                        microns['x'] = float(_iv.attrib['value'])
+                    elif _ax == 'YAxis':
+                        microns['y'] = float(_iv.attrib['value'])
+                break
+        if 'x' not in microns or 'y' not in microns:
+            raise ValueError(
+                "Could not find micronsPerPixel XAxis/YAxis in XML.")
+        return microns
 
 
 def paq_read(file_path=None, plot=False, save_path=None):
